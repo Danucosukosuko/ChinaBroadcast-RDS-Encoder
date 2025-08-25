@@ -183,7 +183,7 @@ This tool sends RDS frames to an FM transmitter. Use it only with equipment you 
 
 ## License
 
-Suggested: MIT (or change to your preferred license). Add a `LICENSE` file if needed.
+GNU GPLv3
 
 ---
 
