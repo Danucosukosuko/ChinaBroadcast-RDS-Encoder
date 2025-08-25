@@ -47,7 +47,7 @@ Notes:
 
 ## Files
 
-* `pyrds_web_ct_pc_toggle.py` — main script (contains Tkinter GUI, RDS worker, Flask app and CLI entrypoint).
+* `rdsencoder.py` — main script (contains Tkinter GUI, RDS worker, Flask app and CLI entrypoint).
 * `config.json` — configuration file created/updated by the GUI or web interface.
 
 ---
