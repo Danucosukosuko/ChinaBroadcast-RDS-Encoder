@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Chinabroadcast GD-2015 RDS Encoder — versión con envío CT cada minuto
+Incluye opción "Omit offset (send raw PC time)".
+"""
+
 import sys
 import os
 import json
@@ -135,15 +142,14 @@ def parse_manual_ct_datetime(manual_str: str):
     """
     Acepta:
       - 'YYYY-MM-DD HH:MM'
-      - 'HH:MM' (uses the computer time)
-    Returns datetime.
+      - 'HH:MM' (usa la fecha del PC)
+    Returns datetime UTC-aware.
     """
     if not manual_str or not manual_str.strip():
         return None
     s = manual_str.strip()
     try:
         dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
-        # asumimos hora local del PC -> convertir a UTC
         local_tz = datetime.now().astimezone().tzinfo
         dt_local = dt.replace(tzinfo=local_tz)
         return dt_local.astimezone(timezone.utc)
@@ -158,6 +164,14 @@ def parse_manual_ct_datetime(manual_str: str):
         except Exception:
             return None
 
+def get_pc_offset_minutes() -> int:
+    """Devuelve el offset del PC en minutos (ej: +120)."""
+    local = datetime.now().astimezone()
+    offs = local.utcoffset()
+    if offs is None:
+        return 0
+    return int(offs.total_seconds() // 60)
+
 # ----------------- Data classes -----------------
 @dataclass
 class RDSParams:
@@ -171,7 +185,8 @@ class RDSParams:
 class RDSWorker(threading.Thread):
     def __init__(self, ser: serial.Serial, write_lock: threading.Lock, params: RDSParams,
                  stop_event: threading.Event, q_status: queue.Queue, ct_enabled: bool = False,
-                 ct_offset_minutes: int = 60, ct_use_pc_time: bool = True, ct_manual: str = ""):
+                 ct_offset_minutes: int = 60, ct_use_pc_time: bool = True, ct_manual: str = "",
+                 ct_omit_offset: bool = False):
         super().__init__(daemon=True)
         self.ser = ser
         self.write_lock = write_lock
@@ -182,8 +197,8 @@ class RDSWorker(threading.Thread):
         self.ct_offset_minutes = ct_offset_minutes
         self.ct_use_pc_time = ct_use_pc_time
         self.ct_manual = ct_manual
+        self.ct_omit_offset = ct_omit_offset
 
-    
         self._ct_thread = None
 
     def run(self):
@@ -246,21 +261,42 @@ class RDSWorker(threading.Thread):
             self.q_status.put(("error", f"Unknown error during write: {e}"))
             raise
 
-    def _select_ct_datetime(self):
+    def _get_ct_datetime_and_offset(self):
         """
-        Decide qué datetime usar para CT:
-         - si ct_use_pc_time: usar datetime.now(timezone.utc)
-         - else: intentar parsear ct_manual; si falla fallback a PC time
+        Devuelve (dt_for_payload_utc, offset_minutes_to_send)
+        - Si ct_omit_offset: se crea un datetime con los componentes de la hora local
+          pero con tz=UTC y se envía offset=0 (modo "raw").
+        - Si ct_use_pc_time y NO ct_omit_offset: usa UTC real y envía offset del PC.
+        - Si NO ct_use_pc_time: intenta parsear manual; si falla, usa UTC y el offset configurado.
         """
+        if self.ct_omit_offset:
+            # Tomar la hora local del PC y construir un datetime "falso UTC" con los mismos números
+            now_local = datetime.now().astimezone()
+            dt_fake = datetime(now_local.year, now_local.month, now_local.day,
+                               now_local.hour, now_local.minute, tzinfo=timezone.utc)
+            return dt_fake, 0
+
+        # else: comportamiento "correcto"
         if self.ct_use_pc_time:
-            return datetime.now(timezone.utc)
+            dt_utc = datetime.now(timezone.utc)
+            # Intenta usar el offset real del PC para que el receptor muestre la hora local correctamente
+            try:
+                offset = get_pc_offset_minutes()
+            except Exception:
+                offset = self.ct_offset_minutes
+            return dt_utc, offset
         else:
             parsed = parse_manual_ct_datetime(self.ct_manual)
             if parsed is not None:
-                return parsed
+                return parsed, self.ct_offset_minutes
             else:
                 self.q_status.put(("debug", "CT manual invalid; using PC time as fallback"))
-                return datetime.now(timezone.utc)
+                dt_utc = datetime.now(timezone.utc)
+                try:
+                    offset = get_pc_offset_minutes()
+                except Exception:
+                    offset = self.ct_offset_minutes
+                return dt_utc, offset
 
     # --- CT thread helpers ---
     def _start_ct_thread(self):
@@ -275,29 +311,26 @@ class RDSWorker(threading.Thread):
     def _ct_sender(self):
         """
         Hilo que espera hasta el siguiente cambio de minuto del PC (borde :00) y envía CT justo ahí.
-        Usa la hora local del PC para detectar el borde de minuto.
-        El payload CT se genera con _select_ct_datetime() (devuelve UTC-aware dt).
+        Envía la hora del PC cada minuto según las opciones (omit offset / use PC time / manual).
         """
         last_minute_sent = None
         while not self.stop_event.is_set():
-            # calcular tiempo hasta el siguiente borde de minuto en hora local del PC
-            now_local = datetime.now().astimezone()  # hora local con tzinfo
+            now_local = datetime.now().astimezone()
             secs_to_next = 60 - now_local.second - (now_local.microsecond / 1_000_000)
             if secs_to_next <= 0:
                 secs_to_next = 0.05
-            # esperar con stop_event para poder interrumpir la espera
             if self.stop_event.wait(timeout=secs_to_next):
                 break
 
-            # justo después del wake up, construir y enviar CT (payload en UTC)
             try:
-                ct_dt = self._select_ct_datetime()
-                if last_minute_sent is None or ct_dt.minute != last_minute_sent:
-                    ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, ct_dt,
-                                                             self.ct_offset_minutes, pty=0, tp=0)
+                dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
+                # evitar envíos duplicados si el minuto no cambia (por seguridad)
+                if last_minute_sent is None or dt_for_payload.minute != last_minute_sent:
+                    ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload,
+                                                             offset_to_send, pty=0, tp=0)
                     self._safe_write(ct_frame)
-                    self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)}"))
-                    last_minute_sent = ct_dt.minute
+                    self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset})"))
+                    last_minute_sent = dt_for_payload.minute
             except Exception as e:
                 self.q_status.put(("debug", f"CT thread failed to send: {e}"))
                 # seguir intentando el siguiente minuto
@@ -398,11 +431,11 @@ class RDSWorker(threading.Thread):
         last_minute_sent = None
         if self.ct_enabled:
             try:
-                ct_dt = self._select_ct_datetime()
-                ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, ct_dt, self.ct_offset_minutes, pty=0, tp=0)
+                dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
+                ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload, offset_to_send, pty=0, tp=0)
                 self._safe_write(ct_frame)
-                self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (using PC time: {self.ct_use_pc_time})"))
-                last_minute_sent = ct_dt.minute
+                self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset})"))
+                last_minute_sent = dt_for_payload.minute
                 for _ in range(5):
                     if self.stop_event.is_set():
                         return
@@ -414,7 +447,7 @@ class RDSWorker(threading.Thread):
         if self.ct_enabled:
             self._start_ct_thread()
 
-        # --- Bucle principal: repetir PS y RT (sin checks CT aquí; el hilo CT se encarga) ---
+        # --- Bucle principal: repetir PS y RT (el hilo CT se encarga de los CTs) ---
         while not self.stop_event.is_set():
             # PS loop
             for i in range(4):
@@ -435,7 +468,6 @@ class RDSWorker(threading.Thread):
                 for _ in range(10):
                     if self.stop_event.is_set():
                         break
-                    # CT checks removed; CT thread will send on minute change
                     time.sleep(0.1)
                 if self.stop_event.is_set():
                     return
@@ -465,7 +497,6 @@ class RDSWorker(threading.Thread):
                 for _ in range(10):
                     if self.stop_event.is_set():
                         break
-                    # CT checks removed; CT thread will send on minute change
                     time.sleep(0.1)
                 if self.stop_event.is_set():
                     return
@@ -551,6 +582,13 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
           </div>
         </div>
 
+        <div class="row mt-2">
+          <div class="col-md-3">
+            <label class="form-label">Omit offset (send raw PC time)</label><br>
+            <input type="checkbox" name="ct_omit_offset" {% if cfg.ct_omit_offset %}checked{% endif %}>
+          </div>
+        </div>
+
         <div class="row mt-3">
           <div class="col-md-12">
             <button class="btn btn-primary" type="submit">Save Config</button>
@@ -593,7 +631,8 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             "ct_enabled": bool(form.get("ct_enabled")),
             "ct_offset": int(form.get("ct_offset") or 60),
             "ct_use_pc_time": bool(form.get("ct_use_pc_time")),
-            "ct_manual": form.get("ct_manual", "")
+            "ct_manual": form.get("ct_manual", ""),
+            "ct_omit_offset": bool(form.get("ct_omit_offset"))
         }
         command_queue.put(("apply_config", cfg))
         return redirect(url_for("index"))
@@ -649,7 +688,8 @@ class App:
             "ct_enabled": False,
             "ct_offset": 60,
             "ct_use_pc_time": True,
-            "ct_manual": ""
+            "ct_manual": "",
+            "ct_omit_offset": False
         }
 
         self._build_ui()
@@ -751,6 +791,11 @@ class App:
         self.entry_ct_manual = ttk.Entry(gb_ct, width=20)
         self.entry_ct_manual.pack(side=tk.LEFT, padx=(0,6))
         self.entry_ct_manual.insert(0, "")
+
+        # Nuevo checkbox: Omit offset (send raw PC time)
+        self.var_ct_omit = tk.BooleanVar(value=False)
+        chk_ct_omit = ttk.Checkbutton(gb_ct, text="Omit offset (send raw PC time)", variable=self.var_ct_omit)
+        chk_ct_omit.pack(side=tk.LEFT, padx=(12,6))
 
         # debug controls
         gb_debugctrl = ttk.LabelFrame(frm, text="Debug")
@@ -903,9 +948,11 @@ class App:
             ct_offset = 60
         ct_use_pc_time = bool(self.var_ct_use_pc.get())
         ct_manual = self.entry_ct_manual.get().strip()
+        ct_omit = bool(self.var_ct_omit.get())
         self.worker = RDSWorker(self.ser, self.serial_write_lock, params, self.stop_event, self.status_queue,
                                 ct_enabled=ct_enabled, ct_offset_minutes=ct_offset,
-                                ct_use_pc_time=ct_use_pc_time, ct_manual=ct_manual)
+                                ct_use_pc_time=ct_use_pc_time, ct_manual=ct_manual,
+                                ct_omit_offset=ct_omit)
         self.worker.start()
         self.btn_send.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -928,12 +975,10 @@ class App:
             if self.worker.is_alive():
                 self.status_var.set("Worker did not stop cleanly (forcing).")
             else:
-                # intentar join corto del worker
                 try:
                     self.worker.join(timeout=1.0)
                 except Exception:
                     pass
-                # si existe hilo CT, intentar join corto
                 try:
                     if hasattr(self.worker, "_ct_thread") and self.worker._ct_thread is not None:
                         self.worker._ct_thread.join(timeout=1.0)
@@ -976,7 +1021,8 @@ class App:
             "ct_enabled": bool(self.var_ct.get()),
             "ct_offset": ct_offset_val,
             "ct_use_pc_time": bool(self.var_ct_use_pc.get()),
-            "ct_manual": self.entry_ct_manual.get().strip()
+            "ct_manual": self.entry_ct_manual.get().strip(),
+            "ct_omit_offset": bool(self.var_ct_omit.get())
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1015,6 +1061,7 @@ class App:
             self.entry_ct_offset.delete(0, tk.END); self.entry_ct_offset.insert(0, str(cfg.get("ct_offset", 60)))
             self.var_ct_use_pc.set(bool(cfg.get("ct_use_pc_time", True)))
             self.entry_ct_manual.delete(0, tk.END); self.entry_ct_manual.insert(0, cfg.get("ct_manual", ""))
+            self.var_ct_omit.set(bool(cfg.get("ct_omit_offset", False)))
             self._on_ct_use_pc_changed()
             self.status_var.set(f"Config loaded from {CONFIG_FILE}")
             self.cfg.update(cfg)
@@ -1102,6 +1149,8 @@ class App:
                 self.var_ct_use_pc.set(bool(cfg.get("ct_use_pc_time", True)))
             if "ct_manual" in cfg:
                 self.entry_ct_manual.delete(0, tk.END); self.entry_ct_manual.insert(0, cfg.get("ct_manual", ""))
+            if "ct_omit_offset" in cfg:
+                self.var_ct_omit.set(bool(cfg.get("ct_omit_offset", False)))
             self._on_ct_use_pc_changed()
             self.save_config()
             self.status_var.set("Config updated from web UI and saved ✅")
@@ -1173,7 +1222,8 @@ def main():
             "ct_enabled": False,
             "ct_offset": 120,
             "ct_use_pc_time": True,
-            "ct_manual": ""
+            "ct_manual": "",
+            "ct_omit_offset": False
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -1202,4 +1252,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
