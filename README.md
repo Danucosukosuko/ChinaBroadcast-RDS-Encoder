@@ -1,5 +1,7 @@
 # Chinabroadcast RDS Encoder
 
+http://chinabroadcast.aliexpress.com/
+
 **RDS control (tkinter + Flask) with CT and PC-time toggle**
 
 A Python tool for sending RDS (Radio Data System) packets to an FM transmitter over a serial interface. It provides a Tkinter GUI for local control, a small Flask-based web UI for remote configuration and quick actions, and an optional Clock Time (CT, RDS Group 4A) sender which can use the PC clock or a manual timestamp. Only for GD-2015 FM Transmitter.
