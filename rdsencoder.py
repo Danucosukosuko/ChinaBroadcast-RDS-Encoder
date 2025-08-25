@@ -582,8 +582,8 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             "port": form.get("port", ""),
             "baud": int(form.get("baud", 9600)),
             "pty_index": int(form.get("pty_index", 1)),
-            "pi": form.get("pi", "E230"),
-            "ps": form.get("ps", "LOS40 CL"),
+            "pi": form.get("pi", "C121"),
+            "ps": form.get("ps", "GD-2015"),
             "rt": form.get("rt", ""),
             "rt_address": form.get("rt_address", "2"),
             "debug": bool(form.get("debug")),
@@ -662,7 +662,7 @@ class App:
             self.root.after(700, self._try_auto_start)
 
     def _build_ui(self):
-        self.root.title("WXSZ RDS Control (tk+web+CT toggle) — FIXED ✨")
+        self.root.title("Chinabroadcast GD-2015 RDS Encoder")
         self.root.geometry("1020x780")
         frm = ttk.Frame(self.root, padding=8)
         frm.pack(fill=tk.BOTH, expand=True)
@@ -1004,9 +1004,9 @@ class App:
                 self.combo_pty.current(int(cfg.get("pty_index", 1)))
             except Exception:
                 pass
-            self.entry_pi.delete(0, tk.END); self.entry_pi.insert(0, cfg.get("pi", "E230"))
-            self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, cfg.get("ps", "LOS40 CL"))
-            self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", cfg.get("rt", "LOS40 Classic Candeleda 94.0 - Solo tus numeros uno"))
+            self.entry_pi.delete(0, tk.END); self.entry_pi.insert(0, cfg.get("pi", "C121"))
+            self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, cfg.get("ps", "GD-2015"))
+            self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", cfg.get("rt", "GD-2015 FM Transmitter! Web: http://chinabroadcast.aliexpress.com/"))
             self.var_rtaddr.set(cfg.get("rt_address", "2"))
             self.var_debug.set(bool(cfg.get("debug", False)))
             self.var_logfile.set(bool(cfg.get("save_log", False)))
@@ -1081,9 +1081,9 @@ class App:
                 except Exception:
                     pass
             if "pi" in cfg:
-                self.entry_pi.delete(0, tk.END); self.entry_pi.insert(0, cfg.get("pi", "E230"))
+                self.entry_pi.delete(0, tk.END); self.entry_pi.insert(0, cfg.get("pi", "C121"))
             if "ps" in cfg:
-                self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, cfg.get("ps", "LOS40 CL"))
+                self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, cfg.get("ps", "GD-2015"))
             if "rt" in cfg:
                 self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", cfg.get("rt", ""))
             if "rt_address" in cfg:
@@ -1162,7 +1162,7 @@ def main():
             "port": "",
             "baud": 9600,
             "pty_index": 1,
-            "pi": "C327",
+            "pi": "C121",
             "ps": "GD-2015",
             "rt": "GD-2015 FM Transmitter! Aliexpress: http://chinabroadcast.aliexpress.com/",
             "rt_address": "2",
