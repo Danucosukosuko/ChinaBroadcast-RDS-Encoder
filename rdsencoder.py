@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Chinabroadcast GD-2015 RDS Encoder — versión con envío CT cada minuto
-Incluye opción "Omit offset (send raw PC time)".
-"""
 
 import sys
 import os
@@ -108,6 +103,10 @@ def encode_local_time_offset_minutes(offset_minutes: int) -> int:
 
 def make_rds_ct_payload_and_frame(pi_hex: str, dt_utc: datetime, local_offset_minutes: int,
                                   pty: int = 0, tp: int = 0) -> bytes:
+    """
+    Construye el frame (grupo 4A) de CT. tp=0/1 se coloca en block2.
+    (No metemos TA aquí porque TA pertenece semánticamente a grupos 0A/0B/15B)
+    """
     dt = dt_utc.astimezone(timezone.utc)
     mjd = mjd_from_datetime_utc(dt)
     hour = dt.hour
@@ -172,6 +171,35 @@ def get_pc_offset_minutes() -> int:
         return 0
     return int(offs.total_seconds() // 60)
 
+# ----------------- Helper: construir grupo 0A con TA -----------------
+def make_rds_group0a_frame(pi_hex: str, tp: int = 0, pty: int = 0, ta: int = 0, ps_bytes_pair=(b' ', b' ')) -> bytes:
+    """
+    Construye un frame para group 0A (basic tuning / PS). Se puede usar para
+    transmitir TA=1 (Traffic Announcement). ps_bytes_pair debe ser dos bloques
+    de 2 bytes cada uno (p. ej. PS_bytes[0], PS_bytes[1]).
+    """
+    GROUP_TYPE = 0
+    VERSION_A = 0
+    top2 = 0  # para 0A no usamos top2 desde payload
+    block3 = (ps_bytes_pair[0][0] << 8) | (ps_bytes_pair[0][1] & 0xFF)
+    block4 = (ps_bytes_pair[1][0] << 8) | (ps_bytes_pair[1][1] & 0xFF)
+
+    block2_base = (GROUP_TYPE << 12) | (VERSION_A << 11) | ((tp & 0x1) << 10) | ((pty & 0x1F) << 5) | ((ta & 0x1) << 4)
+    block2 = block2_base | (top2 & 0x3)
+
+    pi_val = int(pi_hex, 16) & 0xFFFF
+    pi_hi = (pi_val >> 8) & 0xFF
+    pi_lo = pi_val & 0xFF
+    b2_hi = (block2 >> 8) & 0xFF
+    b2_lo = block2 & 0xFF
+    b3_hi = (block3 >> 8) & 0xFF
+    b3_lo = block3 & 0xFF
+    b4_hi = (block4 >> 8) & 0xFF
+    b4_lo = block4 & 0xFF
+
+    frame = bytes([pi_hi, pi_lo, b2_hi, b2_lo, b3_hi, b3_lo, b4_hi, b4_lo, 0x0A])
+    return frame
+
 # ----------------- Data classes -----------------
 @dataclass
 class RDSParams:
@@ -184,9 +212,10 @@ class RDSParams:
 # ----------------- RDS Worker -----------------
 class RDSWorker(threading.Thread):
     def __init__(self, ser: serial.Serial, write_lock: threading.Lock, params: RDSParams,
-                 stop_event: threading.Event, q_status: queue.Queue, ct_enabled: bool = False,
-                 ct_offset_minutes: int = 60, ct_use_pc_time: bool = True, ct_manual: str = "",
-                 ct_omit_offset: bool = False):
+                 stop_event: threading.Event, q_status: queue.Queue,
+                 ct_enabled: bool = False, ct_offset_minutes: int = 60,
+                 ct_use_pc_time: bool = True, ct_manual: str = "",
+                 ct_omit_offset: bool = False, ct_tp: bool = False, ct_ta: bool = False):
         super().__init__(daemon=True)
         self.ser = ser
         self.write_lock = write_lock
@@ -198,6 +227,8 @@ class RDSWorker(threading.Thread):
         self.ct_use_pc_time = ct_use_pc_time
         self.ct_manual = ct_manual
         self.ct_omit_offset = ct_omit_offset
+        self.ct_tp = bool(ct_tp)
+        self.ct_ta = bool(ct_ta)
 
         self._ct_thread = None
 
@@ -270,16 +301,13 @@ class RDSWorker(threading.Thread):
         - Si NO ct_use_pc_time: intenta parsear manual; si falla, usa UTC y el offset configurado.
         """
         if self.ct_omit_offset:
-            # Tomar la hora local del PC y construir un datetime "falso UTC" con los mismos números
             now_local = datetime.now().astimezone()
             dt_fake = datetime(now_local.year, now_local.month, now_local.day,
                                now_local.hour, now_local.minute, tzinfo=timezone.utc)
             return dt_fake, 0
 
-        # else: comportamiento "correcto"
         if self.ct_use_pc_time:
             dt_utc = datetime.now(timezone.utc)
-            # Intenta usar el offset real del PC para que el receptor muestre la hora local correctamente
             try:
                 offset = get_pc_offset_minutes()
             except Exception:
@@ -312,6 +340,7 @@ class RDSWorker(threading.Thread):
         """
         Hilo que espera hasta el siguiente cambio de minuto del PC (borde :00) y envía CT justo ahí.
         Envía la hora del PC cada minuto según las opciones (omit offset / use PC time / manual).
+        El CT incluirá el bit TP si está activado.
         """
         last_minute_sent = None
         while not self.stop_event.is_set():
@@ -324,18 +353,33 @@ class RDSWorker(threading.Thread):
 
             try:
                 dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
-                # evitar envíos duplicados si el minuto no cambia (por seguridad)
                 if last_minute_sent is None or dt_for_payload.minute != last_minute_sent:
                     ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload,
-                                                             offset_to_send, pty=0, tp=0)
+                                                             offset_to_send, pty=0, tp=int(bool(self.ct_tp)))
                     self._safe_write(ct_frame)
-                    self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset})"))
+                    self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
                     last_minute_sent = dt_for_payload.minute
             except Exception as e:
                 self.q_status.put(("debug", f"CT thread failed to send: {e}"))
                 # seguir intentando el siguiente minuto
 
         self.q_status.put(("debug", "CT thread exiting."))
+
+    def _send_group0a_ta(self, PS_bytes):
+        """
+        Envía un grupo 0A con TA=1 (o TA=0 si se quiere retirar).
+        Usa los primeros dos PS 'parts' (2+2 bytes) para el contenido del bloque 3 y 4,
+        para no chocar demasiado con la secuencia PS que emites normalmente.
+        """
+        try:
+            # PS_bytes debe ser una lista de bytes de 2 elementos mínimo
+            pair0 = PS_bytes[0] if len(PS_bytes) > 0 else b"  "
+            pair1 = PS_bytes[1] if len(PS_bytes) > 1 else b"  "
+            frame = make_rds_group0a_frame(self.params.GJ_input, tp=int(bool(self.ct_tp)), pty=0, ta=1, ps_bytes_pair=(pair0, pair1))
+            self._safe_write(frame)
+            self.q_status.put(("debug", f"TA group 0A sent -> {hex_dump(frame)} (TP={int(bool(self.ct_tp))})"))
+        except Exception as e:
+            self.q_status.put(("debug", f"Failed to send TA group: {e}"))
 
     def _send_loop(self):
         slices = self._prepare_slices()
@@ -432,9 +476,9 @@ class RDSWorker(threading.Thread):
         if self.ct_enabled:
             try:
                 dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
-                ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload, offset_to_send, pty=0, tp=0)
+                ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload, offset_to_send, pty=0, tp=int(bool(self.ct_tp)))
                 self._safe_write(ct_frame)
-                self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset})"))
+                self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
                 last_minute_sent = dt_for_payload.minute
                 for _ in range(5):
                     if self.stop_event.is_set():
@@ -443,12 +487,19 @@ class RDSWorker(threading.Thread):
             except Exception as e:
                 self.q_status.put(("debug", f"CT initial failed: {e}"))
 
-        # iniciar hilo que enviará CT justo en el cambio de minuto (usa hora local del PC para detectar el borde)
+        # iniciar hilo CT que enviará CT justo en el cambio de minuto
         if self.ct_enabled:
             self._start_ct_thread()
 
         # --- Bucle principal: repetir PS y RT (el hilo CT se encarga de los CTs) ---
         while not self.stop_event.is_set():
+            # Si TA está activado, enviar grupo 0A con TA=1 para señalización
+            if self.ct_ta:
+                try:
+                    self._send_group0a_ta(PS_bytes)
+                except Exception:
+                    pass
+
             # PS loop
             for i in range(4):
                 if self.stop_event.is_set():
@@ -512,12 +563,12 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     <html>
     <head>
       <meta charset="utf-8">
-      <title>RDS Control - Web (CT)</title>
+      <title>RDS Control - Web (CT / TP / TA)</title>
       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     </head>
     <body class="bg-light">
     <div class="container py-4">
-      <h2>RDS Control — Web Interface (CT)</h2>
+      <h2>RDS Control — Web Interface (CT / TP / TA)</h2>
       <form method="post" action="/save" class="mt-3">
         <div class="row">
           <div class="col-md-6">
@@ -587,6 +638,14 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             <label class="form-label">Omit offset (send raw PC time)</label><br>
             <input type="checkbox" name="ct_omit_offset" {% if cfg.ct_omit_offset %}checked{% endif %}>
           </div>
+          <div class="col-md-3">
+            <label class="form-label">TP (Traffic Programme)</label><br>
+            <input type="checkbox" name="ct_tp" {% if cfg.ct_tp %}checked{% endif %}>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">TA (Traffic Announcement)</label><br>
+            <input type="checkbox" name="ct_ta" {% if cfg.ct_ta %}checked{% endif %}>
+          </div>
         </div>
 
         <div class="row mt-3">
@@ -632,7 +691,9 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             "ct_offset": int(form.get("ct_offset") or 60),
             "ct_use_pc_time": bool(form.get("ct_use_pc_time")),
             "ct_manual": form.get("ct_manual", ""),
-            "ct_omit_offset": bool(form.get("ct_omit_offset"))
+            "ct_omit_offset": bool(form.get("ct_omit_offset")),
+            "ct_tp": bool(form.get("ct_tp")),
+            "ct_ta": bool(form.get("ct_ta"))
         }
         command_queue.put(("apply_config", cfg))
         return redirect(url_for("index"))
@@ -689,7 +750,9 @@ class App:
             "ct_offset": 60,
             "ct_use_pc_time": True,
             "ct_manual": "",
-            "ct_omit_offset": False
+            "ct_omit_offset": False,
+            "ct_tp": False,
+            "ct_ta": False
         }
 
         self._build_ui()
@@ -703,7 +766,7 @@ class App:
 
     def _build_ui(self):
         self.root.title("Chinabroadcast GD-2015 RDS Encoder")
-        self.root.geometry("1020x780")
+        self.root.geometry("1030x820")
         frm = ttk.Frame(self.root, padding=8)
         frm.pack(fill=tk.BOTH, expand=True)
 
@@ -772,7 +835,7 @@ class App:
         self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4,0))
 
         # CT controls
-        gb_ct = ttk.LabelFrame(frm, text="CT (Clock Time)")
+        gb_ct = ttk.LabelFrame(frm, text="CT (Clock Time) & Traffic flags")
         gb_ct.pack(fill=tk.X, padx=6, pady=6)
         self.var_ct = tk.BooleanVar(value=False)
         chk_ct = ttk.Checkbutton(gb_ct, text="Enable CT (group 4A)", variable=self.var_ct)
@@ -782,7 +845,7 @@ class App:
         self.entry_ct_offset.pack(side=tk.LEFT, padx=(0,6))
         self.entry_ct_offset.insert(0, "120")
 
-        # Nuevo checkbox: usar hora del PC para CT?
+        # Use PC time
         self.var_ct_use_pc = tk.BooleanVar(value=True)
         chk_ct_pc = ttk.Checkbutton(gb_ct, text="Use PC time for CT", variable=self.var_ct_use_pc, command=self._on_ct_use_pc_changed)
         chk_ct_pc.pack(side=tk.LEFT, padx=(12,6))
@@ -792,10 +855,18 @@ class App:
         self.entry_ct_manual.pack(side=tk.LEFT, padx=(0,6))
         self.entry_ct_manual.insert(0, "")
 
-        # Nuevo checkbox: Omit offset (send raw PC time)
+        # Omit offset and TP/TA controls
         self.var_ct_omit = tk.BooleanVar(value=False)
         chk_ct_omit = ttk.Checkbutton(gb_ct, text="Omit offset (send raw PC time)", variable=self.var_ct_omit)
         chk_ct_omit.pack(side=tk.LEFT, padx=(12,6))
+
+        self.var_tp = tk.BooleanVar(value=False)
+        chk_tp = ttk.Checkbutton(gb_ct, text="TP (Traffic Programme)", variable=self.var_tp)
+        chk_tp.pack(side=tk.LEFT, padx=(12,6))
+
+        self.var_ta = tk.BooleanVar(value=False)
+        chk_ta = ttk.Checkbutton(gb_ct, text="TA (Traffic Announcement)", variable=self.var_ta)
+        chk_ta.pack(side=tk.LEFT, padx=(12,6))
 
         # debug controls
         gb_debugctrl = ttk.LabelFrame(frm, text="Debug")
@@ -830,7 +901,6 @@ class App:
         self._on_ct_use_pc_changed()
 
     def _on_ct_use_pc_changed(self):
-        # si usamos hora PC, deshabilitamos el campo manual (solo para claridad)
         use_pc = bool(self.var_ct_use_pc.get())
         state = "disabled" if use_pc else "normal"
         try:
@@ -949,10 +1019,12 @@ class App:
         ct_use_pc_time = bool(self.var_ct_use_pc.get())
         ct_manual = self.entry_ct_manual.get().strip()
         ct_omit = bool(self.var_ct_omit.get())
+        ct_tp = bool(self.var_tp.get())
+        ct_ta = bool(self.var_ta.get())
         self.worker = RDSWorker(self.ser, self.serial_write_lock, params, self.stop_event, self.status_queue,
                                 ct_enabled=ct_enabled, ct_offset_minutes=ct_offset,
                                 ct_use_pc_time=ct_use_pc_time, ct_manual=ct_manual,
-                                ct_omit_offset=ct_omit)
+                                ct_omit_offset=ct_omit, ct_tp=ct_tp, ct_ta=ct_ta)
         self.worker.start()
         self.btn_send.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -1022,7 +1094,9 @@ class App:
             "ct_offset": ct_offset_val,
             "ct_use_pc_time": bool(self.var_ct_use_pc.get()),
             "ct_manual": self.entry_ct_manual.get().strip(),
-            "ct_omit_offset": bool(self.var_ct_omit.get())
+            "ct_omit_offset": bool(self.var_ct_omit.get()),
+            "ct_tp": bool(self.var_tp.get()),
+            "ct_ta": bool(self.var_ta.get())
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1062,6 +1136,8 @@ class App:
             self.var_ct_use_pc.set(bool(cfg.get("ct_use_pc_time", True)))
             self.entry_ct_manual.delete(0, tk.END); self.entry_ct_manual.insert(0, cfg.get("ct_manual", ""))
             self.var_ct_omit.set(bool(cfg.get("ct_omit_offset", False)))
+            self.var_tp.set(bool(cfg.get("ct_tp", False)))
+            self.var_ta.set(bool(cfg.get("ct_ta", False)))
             self._on_ct_use_pc_changed()
             self.status_var.set(f"Config loaded from {CONFIG_FILE}")
             self.cfg.update(cfg)
@@ -1151,6 +1227,10 @@ class App:
                 self.entry_ct_manual.delete(0, tk.END); self.entry_ct_manual.insert(0, cfg.get("ct_manual", ""))
             if "ct_omit_offset" in cfg:
                 self.var_ct_omit.set(bool(cfg.get("ct_omit_offset", False)))
+            if "ct_tp" in cfg:
+                self.var_tp.set(bool(cfg.get("ct_tp", False)))
+            if "ct_ta" in cfg:
+                self.var_ta.set(bool(cfg.get("ct_ta", False)))
             self._on_ct_use_pc_changed()
             self.save_config()
             self.status_var.set("Config updated from web UI and saved ✅")
@@ -1197,7 +1277,7 @@ class App:
 
 # ----------------- main -----------------
 def main():
-    parser = argparse.ArgumentParser(description="RDS control (tkinter + Flask) with CT and PC time toggle")
+    parser = argparse.ArgumentParser(description="RDS control (tkinter + Flask) with CT, TP and TA")
     parser.add_argument("start", nargs="?", help="use 'start' to autostart sending", default=None)
     parser.add_argument("--port", type=int, help="HTTP server port (default from config or 8080)", default=None)
     args = parser.parse_args()
@@ -1223,7 +1303,9 @@ def main():
             "ct_offset": 120,
             "ct_use_pc_time": True,
             "ct_manual": "",
-            "ct_omit_offset": False
+            "ct_omit_offset": False,
+            "ct_tp": False,
+            "ct_ta": False
         }
         if os.path.exists(CONFIG_FILE):
             try:
