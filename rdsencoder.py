@@ -660,7 +660,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
 
       <hr>
       <h5>Quick actions</h5>
-      <p>Desde aquí puedes arrancar/parar el envío RDS y guardar configuración. Los cambios se aplican automáticamente en la GUI.</p>
+      <p>Here, you can adjust the RDS settings.</p>
 
     </div>
     </body>
