@@ -96,7 +96,7 @@ def encode_local_time_offset_minutes(offset_minutes: int) -> int:
     sign = 0 if offset_minutes >= 0 else 1
     mag = abs(offset_minutes) // 30
     if mag > 0x1F:
-        raise ValueError("Offset fuera de rango (-15.5h .. +15.5h)")
+        raise ValueError("Offset out of range (-15.5h .. +15.5h)")
     return (sign << 5) | (mag & 0x1F)
 
 def make_rds_ct_payload_and_frame(pi_hex: str, dt_utc: datetime, local_offset_minutes: int,
@@ -135,8 +135,8 @@ def parse_manual_ct_datetime(manual_str: str):
     """
     Acepta:
       - 'YYYY-MM-DD HH:MM'
-      - 'HH:MM' (usa la fecha actual del PC)
-    Devuelve datetime timezone-aware en UTC.
+      - 'HH:MM' (uses the computer time)
+    Returns datetime.
     """
     if not manual_str or not manual_str.strip():
         return None
@@ -183,7 +183,7 @@ class RDSWorker(threading.Thread):
         self.ct_use_pc_time = ct_use_pc_time
         self.ct_manual = ct_manual
 
-        # nuevo: hilo que enviará CT justo al cambio de minuto
+    
         self._ct_thread = None
 
     def run(self):
@@ -275,7 +275,7 @@ class RDSWorker(threading.Thread):
     def _ct_sender(self):
         """
         Hilo que espera hasta el siguiente cambio de minuto del PC (borde :00) y envía CT justo ahí.
-        Usa la hora local del PC para detectar el borde de minuto (porque el usuario pidió "cuando cambie un minuto del PC").
+        Usa la hora local del PC para detectar el borde de minuto.
         El payload CT se genera con _select_ct_datetime() (devuelve UTC-aware dt).
         """
         last_minute_sent = None
@@ -638,9 +638,9 @@ class App:
             "port": "",
             "baud": 9600,
             "pty_index": 1,
-            "pi": "E230",
-            "ps": "LOS40 CL",
-            "rt": "LOS40 Classic Candeleda 94.0 - Solo tus numeros uno",
+            "pi": "C121",
+            "ps": "GD-2015",
+            "rt": "GD-2015",
             "rt_address": "2",
             "debug": False,
             "save_log": False,
@@ -700,21 +700,21 @@ class App:
         ttk.Label(gb_pi, text="PI (4 hex chars):").pack(anchor=tk.W, padx=6, pady=(4,0))
         self.entry_pi = ttk.Entry(gb_pi)
         self.entry_pi.pack(padx=6, pady=4)
-        self.entry_pi.insert(0, "E230")
+        self.entry_pi.insert(0, "C121")
 
         gb_ps = ttk.LabelFrame(mid, text="Program Identification (PS)")
         gb_ps.pack(side=tk.LEFT, padx=6, pady=3, fill=tk.Y)
         ttk.Label(gb_ps, text="PS (max 16 chars):").pack(anchor=tk.W, padx=6, pady=(4,0))
         self.entry_ps = ttk.Entry(gb_ps, width=30)
         self.entry_ps.pack(padx=6, pady=4)
-        self.entry_ps.insert(0, "LOS40 CL")
+        self.entry_ps.insert(0, "GD-2015")
 
         gb_rt = ttk.LabelFrame(frm, text="RadioText (RT)")
         gb_rt.pack(fill=tk.BOTH, padx=6, pady=6, expand=True)
         ttk.Label(gb_rt, text="RT (max 64 chars):").pack(anchor=tk.W, padx=6)
         self.text_rt = tk.Text(gb_rt, height=6, wrap=tk.WORD)
         self.text_rt.pack(fill=tk.BOTH, padx=6, pady=4, expand=True)
-        self.text_rt.insert("1.0", "LOS40 Classic Candeleda 94.0 - Solo tus numeros uno")
+        self.text_rt.insert("1.0", "GD-2015")
 
         pan = ttk.Frame(frm)
         pan.pack(fill=tk.X, padx=6)
@@ -740,7 +740,7 @@ class App:
         ttk.Label(gb_ct, text="CT offset (minutes)").pack(side=tk.LEFT, padx=(12,2))
         self.entry_ct_offset = ttk.Entry(gb_ct, width=6)
         self.entry_ct_offset.pack(side=tk.LEFT, padx=(0,6))
-        self.entry_ct_offset.insert(0, "60")
+        self.entry_ct_offset.insert(0, "120")
 
         # Nuevo checkbox: usar hora del PC para CT?
         self.var_ct_use_pc = tk.BooleanVar(value=True)
