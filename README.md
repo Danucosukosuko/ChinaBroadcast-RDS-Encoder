@@ -68,7 +68,7 @@ Notes:
 ## Clock Time (CT) behavior and details
 
 * CT is implemented as RDS Group 4A (the script sets Group Type = 4, version A).
-* The CT payload encodes Modified Julian Date, hour, minute and a signed local time offset in 30-minute steps. The code contains helper functions to compute MJD and to encode the offset.
+* The CT payload encodes Modified Julian Date, hour, minute and a signed local time offset. The code contains helper functions to compute MJD and to encode the offset.
 * `ct_use_pc_time` (boolean): when `True`, CT uses the PC system time (UTC-aware `datetime.now(timezone.utc)`). When `False`, the script attempts to parse the `ct_manual` field. If parsing fails, it falls back to PC time and logs a debug message.
 * `ct_manual` formats accepted:
 
