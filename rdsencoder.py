@@ -12,6 +12,7 @@ from typing import List
 
 from datetime import datetime, timezone, timedelta
 
+import webbrowser
 import serial
 import serial.tools.list_ports
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
@@ -697,7 +698,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
           await updateLCD("CT Error", j.error);
           return;
         }
-        // Per request: do not show CT details. Only show a confirmation and TA state.
         const ta = j.ta_enabled ? "TA: ON" : "TA: OFF";
         await updateLCD("CT transmission triggered", ta);
       }
@@ -793,8 +793,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             ct_offset_cfg = int(cfg.get("ct_offset", 60) or 60)
             ta_enabled = bool(cfg.get("ct_ta", False))
 
-            # Compute internal CT values as worker would (kept for correctness),
-            # but do not expose detailed time or offset to the UI.
             if ct_omit:
                 now_local = datetime.now().astimezone()
                 dt_for_payload = datetime(now_local.year, now_local.month, now_local.day,
@@ -822,7 +820,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
                         offset_to_send = ct_offset_cfg
                     mode = "pc-time(fallback)"
 
-            # Return only a minimal confirmation and TA status (no CT technical details).
             return jsonify({
                 "status": "ct_triggered",
                 "ta_enabled": ta_enabled
@@ -899,6 +896,9 @@ class App:
         self.btn_open.pack(side=tk.LEFT, padx=(0,8))
         self.btn_savecfg = ttk.Button(row, text="Save Config", command=self.save_config)
         self.btn_savecfg.pack(side=tk.LEFT, padx=(0,8))
+        # New: LINK TO WEB button in the Tkinter window
+        self.btn_link_tk = ttk.Button(row, text="LINK TO WEB", command=self.open_web)
+        self.btn_link_tk.pack(side=tk.LEFT, padx=(0,8))
         self.led_canvas = tk.Canvas(row, width=14, height=14, highlightthickness=0)
         self.led_canvas.pack(side=tk.LEFT)
         self._set_led_color("gray")
@@ -1011,6 +1011,15 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._on_ct_use_pc_changed()
+
+    def open_web(self):
+        """Open the Flask web UI in the default browser using the known server port."""
+        try:
+            url = f"http://127.0.0.1:{self.http_port}/"
+            webbrowser.open_new_tab(url)
+            self.status_var.set(f"Opened web interface at {url}")
+        except Exception as e:
+            self.status_var.set(f"Failed to open browser: {e}")
 
     def _on_ct_use_pc_changed(self):
         use_pc = bool(self.var_ct_use_pc.get())
