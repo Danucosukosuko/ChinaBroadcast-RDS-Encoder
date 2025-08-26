@@ -55,7 +55,7 @@ PTY_TABLE = [
     ("03A8", "Documentary"),
 ]
 
-# ----------------- Util functions -----------------
+# ----------------- Utility functions -----------------
 def replace_char(s: str, index: int, newchar: str) -> str:
     if s is None or index < 0 or index >= len(s):
         return s
@@ -86,12 +86,12 @@ def to_hex_byte(hexstr: str) -> int:
 def hex_dump(buffer: bytes) -> str:
     return " ".join(f"{b:02X}" for b in buffer)
 
-# ----------------- CT (Clock Time) helpers -----------------
+# ----------------- CT helpers -----------------
 def mjd_from_datetime_utc(dt_utc: datetime) -> int:
     dt = dt_utc.astimezone(timezone.utc)
     secs = dt.timestamp()
     days = secs / 86400.0
-    mjd = int(days + 40587)  # MJD reference
+    mjd = int(days + 40587)
     return mjd
 
 def encode_local_time_offset_minutes(offset_minutes: int) -> int:
@@ -103,10 +103,6 @@ def encode_local_time_offset_minutes(offset_minutes: int) -> int:
 
 def make_rds_ct_payload_and_frame(pi_hex: str, dt_utc: datetime, local_offset_minutes: int,
                                   pty: int = 0, tp: int = 0) -> bytes:
-    """
-    Construye el frame (grupo 4A) de CT. tp=0/1 se coloca en block2.
-    (No metemos TA aquí porque TA pertenece semánticamente a grupos 0A/0B/15B)
-    """
     dt = dt_utc.astimezone(timezone.utc)
     mjd = mjd_from_datetime_utc(dt)
     hour = dt.hour
@@ -138,12 +134,6 @@ def make_rds_ct_payload_and_frame(pi_hex: str, dt_utc: datetime, local_offset_mi
     return frame
 
 def parse_manual_ct_datetime(manual_str: str):
-    """
-    Acepta:
-      - 'YYYY-MM-DD HH:MM'
-      - 'HH:MM' (usa la fecha del PC)
-    Returns datetime UTC-aware.
-    """
     if not manual_str or not manual_str.strip():
         return None
     s = manual_str.strip()
@@ -164,23 +154,17 @@ def parse_manual_ct_datetime(manual_str: str):
             return None
 
 def get_pc_offset_minutes() -> int:
-    """Devuelve el offset del PC en minutos (ej: +120)."""
     local = datetime.now().astimezone()
     offs = local.utcoffset()
     if offs is None:
         return 0
     return int(offs.total_seconds() // 60)
 
-# ----------------- Helper: construir grupo 0A con TA -----------------
+# ----------------- Helper to build group 0A with TA -----------------
 def make_rds_group0a_frame(pi_hex: str, tp: int = 0, pty: int = 0, ta: int = 0, ps_bytes_pair=(b' ', b' ')) -> bytes:
-    """
-    Construye un frame para group 0A (basic tuning / PS). Se puede usar para
-    transmitir TA=1 (Traffic Announcement). ps_bytes_pair debe ser dos bloques
-    de 2 bytes cada uno (p. ej. PS_bytes[0], PS_bytes[1]).
-    """
     GROUP_TYPE = 0
     VERSION_A = 0
-    top2 = 0  # para 0A no usamos top2 desde payload
+    top2 = 0
     block3 = (ps_bytes_pair[0][0] << 8) | (ps_bytes_pair[0][1] & 0xFF)
     block4 = (ps_bytes_pair[1][0] << 8) | (ps_bytes_pair[1][1] & 0xFF)
 
@@ -293,13 +277,6 @@ class RDSWorker(threading.Thread):
             raise
 
     def _get_ct_datetime_and_offset(self):
-        """
-        Devuelve (dt_for_payload_utc, offset_minutes_to_send)
-        - Si ct_omit_offset: se crea un datetime con los componentes de la hora local
-          pero con tz=UTC y se envía offset=0 (modo "raw").
-        - Si ct_use_pc_time y NO ct_omit_offset: usa UTC real y envía offset del PC.
-        - Si NO ct_use_pc_time: intenta parsear manual; si falla, usa UTC y el offset configurado.
-        """
         if self.ct_omit_offset:
             now_local = datetime.now().astimezone()
             dt_fake = datetime(now_local.year, now_local.month, now_local.day,
@@ -326,7 +303,6 @@ class RDSWorker(threading.Thread):
                     offset = self.ct_offset_minutes
                 return dt_utc, offset
 
-    # --- CT thread helpers ---
     def _start_ct_thread(self):
         if not self.ct_enabled:
             return
@@ -337,11 +313,6 @@ class RDSWorker(threading.Thread):
         self.q_status.put(("debug", "CT thread started."))
 
     def _ct_sender(self):
-        """
-        Hilo que espera hasta el siguiente cambio de minuto del PC (borde :00) y envía CT justo ahí.
-        Envía la hora del PC cada minuto según las opciones (omit offset / use PC time / manual).
-        El CT incluirá el bit TP si está activado.
-        """
         last_minute_sent = None
         while not self.stop_event.is_set():
             now_local = datetime.now().astimezone()
@@ -361,18 +332,11 @@ class RDSWorker(threading.Thread):
                     last_minute_sent = dt_for_payload.minute
             except Exception as e:
                 self.q_status.put(("debug", f"CT thread failed to send: {e}"))
-                # seguir intentando el siguiente minuto
 
         self.q_status.put(("debug", "CT thread exiting."))
 
     def _send_group0a_ta(self, PS_bytes):
-        """
-        Envía un grupo 0A con TA=1 (o TA=0 si se quiere retirar).
-        Usa los primeros dos PS 'parts' (2+2 bytes) para el contenido del bloque 3 y 4,
-        para no chocar demasiado con la secuencia PS que emites normalmente.
-        """
         try:
-            # PS_bytes debe ser una lista de bytes de 2 elementos mínimo
             pair0 = PS_bytes[0] if len(PS_bytes) > 0 else b"  "
             pair1 = PS_bytes[1] if len(PS_bytes) > 1 else b"  "
             frame = make_rds_group0a_frame(self.params.GJ_input, tp=int(bool(self.ct_tp)), pty=0, ta=1, ps_bytes_pair=(pair0, pair1))
@@ -415,7 +379,6 @@ class RDSWorker(threading.Thread):
 
         EOL = 0x0A
 
-        # --- Enviar PS (4 paquetes) ---
         self.q_status.put(("status", "Sending PS (4 packets)..."))
         for i in range(4):
             if self.stop_event.is_set():
@@ -439,7 +402,6 @@ class RDSWorker(threading.Thread):
             if self.stop_event.is_set():
                 return
 
-        # --- Enviar RT (16 paquetes) ---
         self.q_status.put(("status", "Sending RT packets..."))
         rt_index = 0
         for addr_index, rtaddr in enumerate(RTadds_int[:16]):
@@ -471,7 +433,6 @@ class RDSWorker(threading.Thread):
 
         self.q_status.put(("status", "All packets sent once. Now looping until Stop."))
 
-        # --- Emisión inicial de CT (si está activado) ---
         last_minute_sent = None
         if self.ct_enabled:
             try:
@@ -487,20 +448,16 @@ class RDSWorker(threading.Thread):
             except Exception as e:
                 self.q_status.put(("debug", f"CT initial failed: {e}"))
 
-        # iniciar hilo CT que enviará CT justo en el cambio de minuto
         if self.ct_enabled:
             self._start_ct_thread()
 
-        # --- Bucle principal: repetir PS y RT (el hilo CT se encarga de los CTs) ---
         while not self.stop_event.is_set():
-            # Si TA está activado, enviar grupo 0A con TA=1 para señalización
             if self.ct_ta:
                 try:
                     self._send_group0a_ta(PS_bytes)
                 except Exception:
                     pass
 
-            # PS loop
             for i in range(4):
                 if self.stop_event.is_set():
                     self.q_status.put(("status", "Stop requested (loop PS)."))
@@ -523,7 +480,6 @@ class RDSWorker(threading.Thread):
                 if self.stop_event.is_set():
                     return
 
-            # RT loop
             rt_index = 0
             for addr_index, rtaddr in enumerate(RTadds_int[:16]):
                 if self.stop_event.is_set():
@@ -565,10 +521,63 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
       <meta charset="utf-8">
       <title>RDS Control - Web (CT / TP / TA)</title>
       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+      <style>
+        .lcd {
+          width: 100%;
+          max-width: 760px;
+          margin: 12px auto;
+          background: linear-gradient(180deg, #0b1220, #06111a);
+          border-radius: 8px;
+          padding: 12px;
+          color: #cfe7ff;
+          box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+          font-family: "Courier New", monospace;
+        }
+        .lcd-screen {
+          background: #0f2a35;
+          border-radius: 6px;
+          padding: 12px;
+          min-height: 72px;
+          color: #9ef0ff;
+          font-size: 18px;
+          display:flex;
+          flex-direction:column;
+          justify-content:center;
+        }
+        .lcd-line {
+          white-space:pre;
+          overflow:hidden;
+          text-overflow:ellipsis;
+        }
+        .btn-lcd {
+          margin-right:6px;
+        }
+        .small-note { color: #b7d7ff; font-size:12px; }
+      </style>
     </head>
     <body class="bg-light">
     <div class="container py-4">
-      <h2>RDS Control — Web Interface (CT / TP / TA)</h2>
+      <h2>RDS Control — Web Interface</h2>
+
+      <div class="lcd">
+        <div class="d-flex justify-content-between align-items-start mb-2">
+          <div>
+            <strong>Virtual Radio LCD</strong><br><span class="small-note">Press PS / RT / CT to show</span>
+          </div>
+          <div>
+            <button id="btn-ps" class="btn btn-outline-primary btn-sm btn-lcd">Show PS</button>
+            <button id="btn-rt" class="btn btn-outline-secondary btn-sm btn-lcd">Show RT</button>
+            <button id="btn-ct" class="btn btn-outline-success btn-sm btn-lcd">Send CT</button>
+            <button id="btn-link" class="btn btn-outline-info btn-sm btn-lcd">LINK TO WEB</button>
+            <button id="btn-refresh" class="btn btn-outline-dark btn-sm btn-lcd">Refresh</button>
+          </div>
+        </div>
+        <div class="lcd-screen" id="lcd-screen" aria-live="polite">
+          <div class="lcd-line" id="lcd-line1">--- VIRTUAL RADIO ---</div>
+          <div class="lcd-line" id="lcd-line2">Press a button to show PS / RT / CT</div>
+        </div>
+      </div>
+
       <form method="post" action="/save" class="mt-3">
         <div class="row">
           <div class="col-md-6">
@@ -658,11 +667,58 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         </div>
       </form>
 
-      <hr>
-      <h5>Quick actions</h5>
-      <p>Here, you can adjust the RDS settings.</p>
-
     </div>
+
+    <script>
+      async function updateLCD(line1, line2) {
+        document.getElementById('lcd-line1').textContent = line1 || '';
+        document.getElementById('lcd-line2').textContent = line2 || '';
+      }
+
+      async function fetchPS() {
+        const r = await fetch('/display/ps');
+        const j = await r.json();
+        await updateLCD("PS: " + (j.ps || ""), "");
+      }
+
+      async function fetchRT() {
+        const r = await fetch('/display/rt');
+        const j = await r.json();
+        const rt = j.rt || "";
+        const line1 = rt.substring(0, 32);
+        const line2 = rt.substring(32, 64);
+        await updateLCD(line1, line2);
+      }
+
+      async function fetchCT() {
+        const r = await fetch('/display/ct');
+        const j = await r.json();
+        if (j.error) {
+          await updateLCD("CT Error", j.error);
+          return;
+        }
+        // Per request: do not show CT details. Only show a confirmation and TA state.
+        const ta = j.ta_enabled ? "TA: ON" : "TA: OFF";
+        await updateLCD("CT transmission triggered", ta);
+      }
+
+      document.getElementById('btn-ps').addEventListener('click', fetchPS);
+      document.getElementById('btn-rt').addEventListener('click', fetchRT);
+      document.getElementById('btn-ct').addEventListener('click', fetchCT);
+      document.getElementById('btn-refresh').addEventListener('click', async () => {
+        const first = document.getElementById('lcd-line1').textContent || "";
+        if (first.startsWith("PS:")) fetchPS();
+        else if (first.startsWith("CT transmission")) fetchCT();
+        else fetchRT();
+      });
+      document.getElementById('btn-link').addEventListener('click', () => {
+        try {
+          window.open(window.location.origin, '_blank');
+        } catch (e) {
+          window.open(window.location.href, '_blank');
+        }
+      });
+    </script>
     </body>
     </html>
     """
@@ -713,9 +769,70 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         cfg = get_config_func()
         return jsonify({"status": "ok", "config": cfg})
 
+    @app.route("/display/ps", methods=["GET"])
+    def display_ps():
+        cfg = get_config_func()
+        ps = cfg.get("ps", "")
+        ps_disp = ps[:16]
+        return jsonify({"ps": ps_disp})
+
+    @app.route("/display/rt", methods=["GET"])
+    def display_rt():
+        cfg = get_config_func()
+        rt = cfg.get("rt", "")
+        rt_disp = rt[:64]
+        return jsonify({"rt": rt_disp})
+
+    @app.route("/display/ct", methods=["GET"])
+    def display_ct():
+        cfg = get_config_func()
+        try:
+            ct_omit = bool(cfg.get("ct_omit_offset", False))
+            ct_use_pc = bool(cfg.get("ct_use_pc_time", True))
+            ct_manual = cfg.get("ct_manual", "") or ""
+            ct_offset_cfg = int(cfg.get("ct_offset", 60) or 60)
+            ta_enabled = bool(cfg.get("ct_ta", False))
+
+            # Compute internal CT values as worker would (kept for correctness),
+            # but do not expose detailed time or offset to the UI.
+            if ct_omit:
+                now_local = datetime.now().astimezone()
+                dt_for_payload = datetime(now_local.year, now_local.month, now_local.day,
+                                          now_local.hour, now_local.minute, tzinfo=timezone.utc)
+                offset_to_send = 0
+                mode = "omit-offset"
+            elif ct_use_pc:
+                dt_for_payload = datetime.now(timezone.utc)
+                try:
+                    offset_to_send = get_pc_offset_minutes()
+                except Exception:
+                    offset_to_send = ct_offset_cfg
+                mode = "pc-time"
+            else:
+                parsed = parse_manual_ct_datetime(ct_manual)
+                if parsed is not None:
+                    dt_for_payload = parsed
+                    offset_to_send = ct_offset_cfg
+                    mode = "manual"
+                else:
+                    dt_for_payload = datetime.now(timezone.utc)
+                    try:
+                        offset_to_send = get_pc_offset_minutes()
+                    except Exception:
+                        offset_to_send = ct_offset_cfg
+                    mode = "pc-time(fallback)"
+
+            # Return only a minimal confirmation and TA status (no CT technical details).
+            return jsonify({
+                "status": "ct_triggered",
+                "ta_enabled": ta_enabled
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     return app
 
-# ----------------- Tkinter App -----------------
+# ----------------- Tkinter application -----------------
 class App:
     def __init__(self, root, command_queue: queue.Queue, status_queue: queue.Queue, autostart=False, http_port=DEFAULT_HTTP_PORT):
         self.root = root
@@ -765,7 +882,7 @@ class App:
             self.root.after(700, self._try_auto_start)
 
     def _build_ui(self):
-        self.root.title("Chinabroadcast GD-2015 RDS Encoder")
+        self.root.title("GD-2015 RDS Encoder")
         self.root.geometry("1030x820")
         frm = ttk.Frame(self.root, padding=8)
         frm.pack(fill=tk.BOTH, expand=True)
@@ -834,7 +951,6 @@ class App:
         self.btn_stop = ttk.Button(btns, text="Stop", command=self.stop_sending, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4,0))
 
-        # CT controls
         gb_ct = ttk.LabelFrame(frm, text="CT (Clock Time) & Traffic flags")
         gb_ct.pack(fill=tk.X, padx=6, pady=6)
         self.var_ct = tk.BooleanVar(value=False)
@@ -845,7 +961,6 @@ class App:
         self.entry_ct_offset.pack(side=tk.LEFT, padx=(0,6))
         self.entry_ct_offset.insert(0, "120")
 
-        # Use PC time
         self.var_ct_use_pc = tk.BooleanVar(value=True)
         chk_ct_pc = ttk.Checkbutton(gb_ct, text="Use PC time for CT", variable=self.var_ct_use_pc, command=self._on_ct_use_pc_changed)
         chk_ct_pc.pack(side=tk.LEFT, padx=(12,6))
@@ -855,7 +970,6 @@ class App:
         self.entry_ct_manual.pack(side=tk.LEFT, padx=(0,6))
         self.entry_ct_manual.insert(0, "")
 
-        # Omit offset and TP/TA controls
         self.var_ct_omit = tk.BooleanVar(value=False)
         chk_ct_omit = ttk.Checkbutton(gb_ct, text="Omit offset (send raw PC time)", variable=self.var_ct_omit)
         chk_ct_omit.pack(side=tk.LEFT, padx=(12,6))
@@ -868,7 +982,6 @@ class App:
         chk_ta = ttk.Checkbutton(gb_ct, text="TA (Traffic Announcement)", variable=self.var_ta)
         chk_ta.pack(side=tk.LEFT, padx=(12,6))
 
-        # debug controls
         gb_debugctrl = ttk.LabelFrame(frm, text="Debug")
         gb_debugctrl.pack(fill=tk.X, padx=6, pady=6)
         self.var_debug = tk.BooleanVar(value=False)
@@ -890,14 +1003,13 @@ class App:
         self.debug_text.pack(fill=tk.BOTH, expand=True)
         self.debug_text.config(state=tk.DISABLED)
 
-        self.status_var = tk.StringVar(value="Ready ✅")
+        self.status_var = tk.StringVar(value="Ready")
         lbl_status = ttk.Label(frm, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         lbl_status.pack(fill=tk.X, padx=6, pady=(4,0))
 
         self.combo_pty.bind("<<ComboboxSelected>>", lambda e: self.pty_changed())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # initial UI state
         self._on_ct_use_pc_changed()
 
     def _on_ct_use_pc_changed(self):
@@ -936,7 +1048,7 @@ class App:
         self.combo_ports['values'] = devices
         if devices:
             self.combo_ports.current(0)
-        self.status_var.set("Ports scanned ✅")
+        self.status_var.set("Ports scanned")
 
     def toggle_port(self):
         if self.ser.is_open:
@@ -952,7 +1064,7 @@ class App:
                         self.serial_write_lock.release()
                 self._set_led_color("gray")
                 self.btn_open.config(text="Open Serial Port")
-                self.status_var.set("Port closed.")
+                self.status_var.set("Port closed")
             except Exception as e:
                 self.status_var.set(f"Port close failed: {e}")
             return
@@ -968,8 +1080,8 @@ class App:
             self.btn_open.config(text="Close Serial Port")
             self.status_var.set(f"Opened {port}")
         except Exception as e:
-            messagebox.showerror("WRONG", f"The serial port fails to open:\n{e}")
-            self.status_var.set("Open failed ❌")
+            messagebox.showerror("Serial error", f"The serial port failed to open:\n{e}")
+            self.status_var.set("Open failed")
 
     def _gather_params(self) -> RDSParams:
         idx = self.combo_pty.current()
@@ -998,7 +1110,7 @@ class App:
                 return
 
         if self.worker and self.worker.is_alive():
-            messagebox.showinfo("Already", "Worker already running.")
+            messagebox.showinfo("Already running", "Worker already running.")
             return
 
         params = self._gather_params()
@@ -1028,7 +1140,7 @@ class App:
         self.worker.start()
         self.btn_send.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
-        self.status_var.set("Sending started... 🚀")
+        self.status_var.set("Sending started")
 
     def stop_sending(self):
         if self.worker and self.worker.is_alive():
@@ -1056,9 +1168,9 @@ class App:
                         self.worker._ct_thread.join(timeout=1.0)
                 except Exception:
                     pass
-                self.status_var.set("Worker stopped.")
+                self.status_var.set("Worker stopped")
         else:
-            self.status_var.set("No worker running.")
+            self.status_var.set("No worker running")
         self.btn_send.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
 
@@ -1101,7 +1213,7 @@ class App:
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
-            self.status_var.set(f"Config saved to {CONFIG_FILE} ✅")
+            self.status_var.set(f"Config saved to {CONFIG_FILE}")
             self.cfg.update(cfg)
         except Exception as e:
             self.status_var.set(f"Save config failed: {e}")
@@ -1126,7 +1238,7 @@ class App:
                 pass
             self.entry_pi.delete(0, tk.END); self.entry_pi.insert(0, cfg.get("pi", "C121"))
             self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, cfg.get("ps", "GD-2015"))
-            self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", cfg.get("rt", "GD-2015 FM Transmitter! Web: http://chinabroadcast.aliexpress.com/"))
+            self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", cfg.get("rt", "GD-2015 FM Transmitter!"))
             self.var_rtaddr.set(cfg.get("rt_address", "2"))
             self.var_debug.set(bool(cfg.get("debug", False)))
             self.var_logfile.set(bool(cfg.get("save_log", False)))
@@ -1167,7 +1279,7 @@ class App:
                 elif typ == "finished":
                     self.btn_send.config(state=tk.NORMAL)
                     self.btn_stop.config(state=tk.DISABLED)
-                    self.status_var.set("Stopped.")
+                    self.status_var.set("Stopped")
         except queue.Empty:
             pass
 
@@ -1233,7 +1345,7 @@ class App:
                 self.var_ta.set(bool(cfg.get("ct_ta", False)))
             self._on_ct_use_pc_changed()
             self.save_config()
-            self.status_var.set("Config updated from web UI and saved ✅")
+            self.status_var.set("Config updated from web UI and saved")
         except Exception as e:
             self.status_var.set(f"Apply remote config failed: {e}")
 
@@ -1255,7 +1367,7 @@ class App:
         if self.ser.is_open:
             self.root.after(200, self.start_sending)
         else:
-            self.status_var.set("Auto-start: no port opened.")
+            self.status_var.set("Auto-start: no port opened")
 
     def _on_close(self):
         self.save_config()
@@ -1293,7 +1405,7 @@ def main():
             "pty_index": 1,
             "pi": "C121",
             "ps": "GD-2015",
-            "rt": "GD-2015 FM Transmitter! Aliexpress: http://chinabroadcast.aliexpress.com/",
+            "rt": "GD-2015 FM Transmitter! ",
             "rt_address": "2",
             "debug": False,
             "save_log": False,
