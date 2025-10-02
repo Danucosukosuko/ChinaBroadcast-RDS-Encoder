@@ -171,12 +171,6 @@ The script contains a built-in `PTY_TABLE` array (hex value, name). The PTY valu
 
 ---
 
-## Safety & legal
-
-This tool sends RDS frames to an FM transmitter. Use it only with equipment you own or are explicitly authorized to test. Transmitting on licensed FM frequencies without authorization is illegal in most jurisdictions. The author and contributors are not responsible for misuse.
-
----
-
 ## Contributing
 
 * Bug reports and pull requests are welcome. Keep changes focused (e.g., add tests, improve error handling or modularize the code).
