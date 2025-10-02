@@ -186,11 +186,3 @@ This tool sends RDS frames to an FM transmitter. Use it only with equipment you 
 ## License
 
 GNU GPLv3
-
----
-
-If you want, I can also:
-
-* Generate a shorter `USAGE.md` showing example sessions and common commands.
-* Produce a sample `config.json` file to ship with the repo.
-* Convert this README to Spanish or another language.
