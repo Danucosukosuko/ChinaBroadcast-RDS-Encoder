@@ -8,7 +8,7 @@ import time
 import queue
 import argparse
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Dict, Any
 
 from datetime import datetime, timezone, timedelta
 
@@ -194,13 +194,112 @@ class RDSParams:
     RT_input: str
     RTaddress: str
 
+# ----------------- Scheduler helpers -----------------
+def parse_schedule_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize a raw schedule entry dict into internal structure:
+    {
+      "days": [0..6],  # Monday=0 ... Sunday=6
+      "start_min": int (minutes from midnight),
+      "ps8": str,
+      "rt64": str,
+      "enabled": bool
+    }
+    raw can have days as ['mon','tue'] or 'weekdays' or 'weekend'
+    """
+    days_src = raw.get("days", [])
+    days_norm = []
+
+    if isinstance(days_src, str):
+        days_src = [days_src]
+
+    for d in days_src:
+        dd = str(d).strip().lower()
+        if dd in ("mon", "monday"):
+            days_norm.append(0)
+        elif dd in ("tue", "tuesday"):
+            days_norm.append(1)
+        elif dd in ("wed", "wednesday"):
+            days_norm.append(2)
+        elif dd in ("thu", "thursday"):
+            days_norm.append(3)
+        elif dd in ("fri", "friday"):
+            days_norm.append(4)
+        elif dd in ("sat", "saturday"):
+            days_norm.append(5)
+        elif dd in ("sun", "sunday"):
+            days_norm.append(6)
+        elif dd in ("weekdays", "entre semana"):
+            days_norm.extend([0,1,2,3,4])
+        elif dd in ("weekend", "weekends", "fines de semana"):
+            days_norm.extend([5,6])
+        elif dd in ("all", "everyday", "todos"):
+            days_norm.extend([0,1,2,3,4,5,6])
+    # dedupe and sort
+    days_norm = sorted(set(days_norm))
+
+    start = raw.get("start_time", "00:00")
+    try:
+        hh, mm = start.split(":")
+        start_min = int(hh) * 60 + int(mm)
+    except Exception:
+        start_min = 0
+
+    ps8 = raw.get("ps", "") or ""
+    if len(ps8) > 8:
+        ps8 = ps8[:8]
+    ps8 = ps8.ljust(8)  # keep length 8
+
+    rt64 = raw.get("rt", "") or ""
+    if len(rt64) > 64:
+        rt64 = rt64[:64]
+    rt64 = rt64.ljust(64)
+
+    enabled = bool(raw.get("enabled", True))
+
+    return {"days": days_norm, "start_min": start_min, "ps8": ps8, "rt64": rt64, "enabled": enabled}
+
+def find_active_schedule_entry(entries: List[Dict[str, Any]], when: Optional[datetime]=None) -> Optional[Dict[str, Any]]:
+    """
+    entries: already normalized via parse_schedule_entry
+    returns the entry with latest start_min <= now for today, among enabled ones,
+    or None if no matching entry.
+    """
+    if when is None:
+        when = datetime.now().astimezone()
+    today_idx = (when.weekday())  # Monday=0 .. Sunday=6
+    now_min = when.hour * 60 + when.minute
+
+    # Filter to entries that include today and are enabled
+    candidates = []
+    for e in entries:
+        if not e.get("enabled", True):
+            continue
+        if today_idx in e.get("days", []):
+            # find the latest start <= now
+            if e.get("start_min", 0) <= now_min:
+                candidates.append(e)
+
+    if not candidates:
+        return None
+    # choose candidate with largest start_min
+    candidates.sort(key=lambda x: x.get("start_min", 0), reverse=True)
+    return candidates[0]
+
+def ps8_to_ps16(ps8: str) -> str:
+    """Convert an 8-char PS into the 16-char used by the rest of the code.
+       We'll duplicate the 8 chars to form 16 (PS halves identical) — common technique."""
+    ps8 = ps8[:8].ljust(8)
+    return ps8 + ps8
+
 # ----------------- RDS Worker -----------------
 class RDSWorker(threading.Thread):
     def __init__(self, ser: serial.Serial, write_lock: threading.Lock, params: RDSParams,
                  stop_event: threading.Event, q_status: queue.Queue,
                  ct_enabled: bool = False, ct_offset_minutes: int = 60,
                  ct_use_pc_time: bool = True, ct_manual: str = "",
-                 ct_omit_offset: bool = False, ct_tp: bool = False, ct_ta: bool = False):
+                 ct_omit_offset: bool = False, ct_tp: bool = False, ct_ta: bool = False,
+                 dynamic_scheduler_enabled: bool = False, scheduler_entries: Optional[List[Dict[str, Any]]] = None):
         super().__init__(daemon=True)
         self.ser = ser
         self.write_lock = write_lock
@@ -215,6 +314,10 @@ class RDSWorker(threading.Thread):
         self.ct_tp = bool(ct_tp)
         self.ct_ta = bool(ct_ta)
 
+        self.dynamic_scheduler_enabled = bool(dynamic_scheduler_enabled)
+        # scheduler_entries: list of normalized entries (parse_schedule_entry)
+        self.scheduler_entries = [parse_schedule_entry(e) for e in (scheduler_entries or [])]
+
         self._ct_thread = None
 
     def run(self):
@@ -225,7 +328,7 @@ class RDSWorker(threading.Thread):
         finally:
             self.q_status.put(("finished", ""))
 
-    def _prepare_slices(self):
+    def _prepare_slices_static(self):
         FG = pad_or_truncate(self.params.FGdata, 4, "0").upper()
         FGdata2 = FG[0:2]
         FGdata3 = FG[2:4]
@@ -346,33 +449,43 @@ class RDSWorker(threading.Thread):
         except Exception as e:
             self.q_status.put(("debug", f"Failed to send TA group: {e}"))
 
-    def _send_loop(self):
-        slices = self._prepare_slices()
-        ser = self.ser
+    def _build_ps_rt_bytes_for_dynamic(self, ps8: str, rt64: str):
+        # ps8 -> ps16 duplicated
+        ps16 = ps8_to_ps16(ps8)
+        PSparts = [ps16[i:i+2] for i in range(0, 16, 2)]
+        PS_bytes = [encode_gb2312_two_bytes(p) for p in PSparts]
+        RTparts = [rt64[i:i+2] for i in range(0, 64, 2)]
+        RT_bytes = [encode_gb2312_two_bytes(p) for p in RTparts]
+        return PS_bytes, RT_bytes
 
-        if not ser.is_open:
+    def _send_loop(self):
+        # Prepare static slices for fallback (if not dynamic or used elsewhere)
+        static_slices = self._prepare_slices_static()
+
+        if not self.ser.is_open:
             raise RuntimeError("Serial port not open")
 
-        PS_bytes = [encode_gb2312_two_bytes(p) for p in slices["PSparts"]]
-        RT_bytes = [encode_gb2312_two_bytes(p) for p in slices["RTparts"]]
+        # Pre-calc static bytes (used when scheduler disabled)
+        PS_bytes_static = [encode_gb2312_two_bytes(p) for p in static_slices["PSparts"]]
+        RT_bytes_static = [encode_gb2312_two_bytes(p) for p in static_slices["RTparts"]]
 
         try:
-            GJ_b0 = to_hex_byte(slices["GJdata2"])
-            GJ_b1 = to_hex_byte(slices["GJdata3"])
-            FG_b = to_hex_byte(slices["FGdata2"])
-            RTAadd2_b = to_hex_byte(slices["RTAadd2"])
+            GJ_b0 = to_hex_byte(static_slices["GJdata2"])
+            GJ_b1 = to_hex_byte(static_slices["GJdata3"])
+            FG_b = to_hex_byte(static_slices["FGdata2"])
+            RTAadd2_b = to_hex_byte(static_slices["RTAadd2"])
         except Exception as e:
             raise ValueError(f"Invalid hex fields (PI/FG): {e}")
 
         PSadds_int = []
-        for s in slices["PSadds"]:
+        for s in static_slices["PSadds"]:
             try:
                 PSadds_int.append(to_hex_byte(s))
             except Exception:
                 PSadds_int.append(0)
 
         RTadds_int = []
-        for s in slices["RTadds"]:
+        for s in static_slices["RTadds"]:
             try:
                 RTadds_int.append(to_hex_byte(s))
             except Exception:
@@ -381,59 +494,56 @@ class RDSWorker(threading.Thread):
         EOL = 0x0A
 
         self.q_status.put(("status", "Sending PS (4 packets)..."))
-        for i in range(4):
-            if self.stop_event.is_set():
-                self.q_status.put(("status", "Stop requested (during PS)."))
-                return
-            buffer = bytearray(9)
-            buffer[0] = GJ_b0
-            buffer[1] = GJ_b1
-            buffer[2] = FG_b
-            buffer[3] = PSadds_int[i]
-            buffer[6] = PS_bytes[i][0]
-            buffer[7] = PS_bytes[i][1]
-            buffer[8] = EOL
-            self._safe_write(bytes(buffer))
-            self.q_status.put(("debug", f"PS {i+1}/4 -> {hex_dump(buffer)}"))
-            self.q_status.put(("status", f"PS packet {i+1}/4 sent."))
-            for _ in range(10):
+
+        def send_ps_loop(PS_bytes_to_use):
+            for i in range(4):
                 if self.stop_event.is_set():
-                    break
-                time.sleep(0.1)
-            if self.stop_event.is_set():
-                return
+                    return False
+                buffer = bytearray(9)
+                buffer[0] = GJ_b0
+                buffer[1] = GJ_b1
+                buffer[2] = FG_b
+                buffer[3] = PSadds_int[i]
+                buffer[6] = PS_bytes_to_use[i][0]
+                buffer[7] = PS_bytes_to_use[i][1]
+                buffer[8] = EOL
+                self._safe_write(bytes(buffer))
+                self.q_status.put(("debug", f"PS {i+1}/4 -> {hex_dump(buffer)}"))
+                self.q_status.put(("status", f"PS packet {i+1}/4 sent."))
+                for _ in range(10):
+                    if self.stop_event.is_set():
+                        break
+                    time.sleep(0.1)
+            return True
 
-        self.q_status.put(("status", "Sending RT packets..."))
-        rt_index = 0
-        for addr_index, rtaddr in enumerate(RTadds_int[:16]):
-            if self.stop_event.is_set():
-                self.q_status.put(("status", "Stop requested (during RT)."))
-                return
-            buffer = bytearray(9)
-            buffer[0] = GJ_b0
-            buffer[1] = GJ_b1
-            buffer[2] = RTAadd2_b
-            buffer[3] = rtaddr
-            r0 = RT_bytes[rt_index]
-            r1 = RT_bytes[rt_index + 1]
-            buffer[4] = r0[0]
-            buffer[5] = r0[1]
-            buffer[6] = r1[0]
-            buffer[7] = r1[1]
-            buffer[8] = EOL
-            self._safe_write(bytes(buffer))
-            self.q_status.put(("debug", f"RT {addr_index+1}/16 (idx {rt_index}) -> {hex_dump(buffer)}"))
-            self.q_status.put(("status", f"RT packet {addr_index+1}/16 sent (RT idx {rt_index})."))
-            rt_index += 2
-            for _ in range(10):
+        def send_rt_loop(RT_bytes_to_use, RTAadd2_b_local):
+            rt_index_local = 0
+            for addr_index, rtaddr in enumerate(RTadds_int[:16]):
                 if self.stop_event.is_set():
-                    break
-                time.sleep(0.1)
-            if self.stop_event.is_set():
-                return
+                    return False
+                buffer = bytearray(9)
+                buffer[0] = GJ_b0
+                buffer[1] = GJ_b1
+                buffer[2] = RTAadd2_b_local
+                buffer[3] = rtaddr
+                r0 = RT_bytes_to_use[rt_index_local]
+                r1 = RT_bytes_to_use[rt_index_local + 1]
+                buffer[4] = r0[0]
+                buffer[5] = r0[1]
+                buffer[6] = r1[0]
+                buffer[7] = r1[1]
+                buffer[8] = EOL
+                self._safe_write(bytes(buffer))
+                self.q_status.put(("debug", f"RT {addr_index+1}/16 -> {hex_dump(buffer)}"))
+                self.q_status.put(("status", f"RT packet {addr_index+1}/16 sent."))
+                rt_index_local += 2
+                for _ in range(10):
+                    if self.stop_event.is_set():
+                        break
+                    time.sleep(0.1)
+            return True
 
-        self.q_status.put(("status", "All packets sent once. Now looping until Stop."))
-
+        # If CT enabled, send initial CT and start thread
         last_minute_sent = None
         if self.ct_enabled:
             try:
@@ -452,62 +562,52 @@ class RDSWorker(threading.Thread):
         if self.ct_enabled:
             self._start_ct_thread()
 
+        # Main loop: either use static PS/RT or dynamic scheduled PS/RT
         while not self.stop_event.is_set():
-            if self.ct_ta:
-                try:
-                    self._send_group0a_ta(PS_bytes)
-                except Exception:
-                    pass
-
-            for i in range(4):
-                if self.stop_event.is_set():
-                    self.q_status.put(("status", "Stop requested (loop PS)."))
-                    return
-                buffer = bytearray(9)
-                buffer[0] = GJ_b0
-                buffer[1] = GJ_b1
-                buffer[2] = FG_b
-                buffer[3] = PSadds_int[i]
-                buffer[6] = PS_bytes[i][0]
-                buffer[7] = PS_bytes[i][1]
-                buffer[8] = EOL
-                self._safe_write(bytes(buffer))
-                self.q_status.put(("debug", f"Loop PS {i+1}/4 -> {hex_dump(buffer)}"))
-                self.q_status.put(("status", f"Loop PS packet {i+1}/4 sent."))
-                for _ in range(10):
-                    if self.stop_event.is_set():
+            # Determine whether to use dynamic scheduler
+            if self.dynamic_scheduler_enabled:
+                active = find_active_schedule_entry(self.scheduler_entries, when=datetime.now().astimezone())
+                if active:
+                    # build PS/RT bytes from active
+                    PS_bytes = []
+                    RT_bytes = []
+                    PS_bytes, RT_bytes = self._build_ps_rt_bytes_for_dynamic(active["ps8"], active["rt64"])
+                    # Send TA if enabled
+                    if self.ct_ta:
+                        try:
+                            self._send_group0a_ta(PS_bytes)
+                        except Exception:
+                            pass
+                    # send PS loop
+                    ok = send_ps_loop(PS_bytes)
+                    if not ok:
                         break
-                    time.sleep(0.1)
-                if self.stop_event.is_set():
-                    return
-
-            rt_index = 0
-            for addr_index, rtaddr in enumerate(RTadds_int[:16]):
-                if self.stop_event.is_set():
-                    self.q_status.put(("status", "Stop requested (loop RT)."))
-                    return
-                buffer = bytearray(9)
-                buffer[0] = GJ_b0
-                buffer[1] = GJ_b1
-                buffer[2] = RTAadd2_b
-                buffer[3] = rtaddr
-                r0 = RT_bytes[rt_index]
-                r1 = RT_bytes[rt_index + 1]
-                buffer[4] = r0[0]
-                buffer[5] = r0[1]
-                buffer[6] = r1[0]
-                buffer[7] = r1[1]
-                buffer[8] = EOL
-                self._safe_write(bytes(buffer))
-                self.q_status.put(("debug", f"Loop RT {addr_index+1}/16 -> {hex_dump(buffer)}"))
-                self.q_status.put(("status", f"Loop RT packet {addr_index+1}/16 sent."))
-                rt_index += 2
-                for _ in range(10):
-                    if self.stop_event.is_set():
+                    # send RT loop
+                    ok = send_rt_loop(RT_bytes, RTAadd2_b)
+                    if not ok:
                         break
-                    time.sleep(0.1)
-                if self.stop_event.is_set():
-                    return
+                else:
+                    # No active schedule entry for now -> skip PS/RT (only wait a bit, keep CT thread running)
+                    self.q_status.put(("status", "Scheduler active but no entry for current time - skipping PS/RT"))
+                    # wait some seconds before checking again
+                    for _ in range(30):
+                        if self.stop_event.is_set():
+                            break
+                        time.sleep(1.0)
+                    continue
+            else:
+                # Static behavior (old behavior)
+                if self.ct_ta:
+                    try:
+                        self._send_group0a_ta(PS_bytes_static)
+                    except Exception:
+                        pass
+                ok = send_ps_loop(PS_bytes_static)
+                if not ok:
+                    break
+                ok = send_rt_loop(RT_bytes_static, RTAadd2_b)
+                if not ok:
+                    break
 
         self.q_status.put(("status", "Stop requested; finishing worker."))
 
@@ -520,7 +620,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     <html>
     <head>
       <meta charset="utf-8">
-      <title>RDS Control - Web (CT / TP / TA)</title>
+      <title>RDS Control - Web (CT / TP / TA / Scheduler)</title>
       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
       <style>
         .lcd {
@@ -545,15 +645,10 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
           flex-direction:column;
           justify-content:center;
         }
-        .lcd-line {
-          white-space:pre;
-          overflow:hidden;
-          text-overflow:ellipsis;
-        }
-        .btn-lcd {
-          margin-right:6px;
-        }
+        .lcd-line { white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+        .btn-lcd { margin-right:6px; }
         .small-note { color: #b7d7ff; font-size:12px; }
+        .sched-row { border-bottom: 1px solid #ddd; padding:6px 0; }
       </style>
     </head>
     <body class="bg-light">
@@ -579,7 +674,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         </div>
       </div>
 
-      <form method="post" action="/save" class="mt-3">
+      <form method="post" action="/save" class="mt-3" id="mainform">
         <div class="row">
           <div class="col-md-6">
             <label class="form-label">Serial port</label>
@@ -605,15 +700,15 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             <input name="pi" class="form-control" value="{{cfg.pi}}">
           </div>
           <div class="col-md-4">
-            <label class="form-label">PS (16 chars)</label>
-            <input name="ps" class="form-control" value="{{cfg.ps}}">
+            <label class="form-label">PS (16 chars) — STATIC</label>
+            <input id="static-ps" name="ps" class="form-control" value="{{cfg.ps}}">
           </div>
         </div>
 
         <div class="row mt-2">
           <div class="col-md-12">
-            <label class="form-label">RT (max 64 chars)</label>
-            <textarea name="rt" class="form-control" rows="2">{{cfg.rt}}</textarea>
+            <label class="form-label">RT (max 64 chars) — STATIC</label>
+            <textarea id="static-rt" name="rt" class="form-control" rows="2">{{cfg.rt}}</textarea>
           </div>
         </div>
 
@@ -656,6 +751,10 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             <label class="form-label">TA (Traffic Announcement)</label><br>
             <input type="checkbox" name="ct_ta" {% if cfg.ct_ta %}checked{% endif %}>
           </div>
+          <div class="col-md-3">
+            <label class="form-label">Use Scheduler (Dynamic RDS)</label><br>
+            <input type="checkbox" id="scheduler-enabled" name="scheduler_enabled" {% if cfg.scheduler_enabled %}checked{% endif %}>
+          </div>
         </div>
 
         <div class="row mt-3">
@@ -664,24 +763,134 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             <a class="btn btn-success" href="/start">Start</a>
             <a class="btn btn-danger" href="/stop">Stop</a>
             <a class="btn btn-secondary" href="/status">Status (JSON)</a>
+            <button type="button" class="btn btn-outline-info" id="btn-edit-sched">Edit Scheduler</button>
           </div>
         </div>
+
+        <!-- Hidden field with scheduler JSON -->
+        <input type="hidden" id="scheduler-json" name="scheduler_json" value='{{cfg.scheduler_json|tojson|safe}}'>
       </form>
+
+      <!-- Scheduler modal (simple) -->
+      <div class="modal" tabindex="-1" id="sched-modal" style="display:none; position:fixed; left:0; top:0; right:0; bottom:0; background: rgba(0,0,0,0.4);">
+        <div style="max-width:900px; margin: 40px auto; background:white; padding:12px; border-radius:6px;">
+          <h5>Scheduler editor</h5>
+          <div class="row">
+            <div class="col-md-3">
+              <label>Days</label>
+              <select id="sel-days" class="form-select">
+                <option value="mon">Monday</option>
+                <option value="tue">Tuesday</option>
+                <option value="wed">Wednesday</option>
+                <option value="thu">Thursday</option>
+                <option value="fri">Friday</option>
+                <option value="sat">Saturday</option>
+                <option value="sun">Sunday</option>
+                <option value="weekdays">Weekdays (Mon-Fri)</option>
+                <option value="weekend">Weekend (Sat-Sun)</option>
+                <option value="all">All days</option>
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label>Start time (HH:MM)</label>
+              <input id="inp-start" class="form-control" value="00:00">
+            </div>
+            <div class="col-md-3">
+              <label>PS (8 chars)</label>
+              <input id="inp-ps" class="form-control" maxlength="8" placeholder="8 chars">
+            </div>
+            <div class="col-md-4">
+              <label>RT (64 chars)</label>
+              <input id="inp-rt" class="form-control" maxlength="64" placeholder="RadioText (64 chars)">
+            </div>
+          </div>
+          <div class="mt-2">
+            <button id="btn-add-sched" class="btn btn-sm btn-primary">Add entry</button>
+            <button id="btn-close-sched" class="btn btn-sm btn-secondary">Close</button>
+          </div>
+
+          <hr>
+          <div id="sched-list" style="max-height:260px; overflow:auto;">
+          </div>
+          <div class="mt-2">
+            <button id="btn-save-sched" class="btn btn-success">Save scheduler to config</button>
+          </div>
+        </div>
+      </div>
 
     </div>
 
     <script>
+      let scheduler = [];
+      try {
+        const raw = document.getElementById('scheduler-json').value;
+        if (raw) scheduler = JSON.parse(raw);
+      } catch(e) {
+        scheduler = [];
+      }
+
+      function renderSchedulerList() {
+        const container = document.getElementById('sched-list');
+        container.innerHTML = '';
+        scheduler.forEach((s,i) => {
+          const div = document.createElement('div');
+          div.className = 'sched-row';
+          const days = Array.isArray(s.days) ? s.days.join(',') : s.days;
+          div.innerHTML = `<div><b>${i+1}.</b> <small>${days} @ ${s.start_time}</small> <button data-i="${i}" class="btn btn-sm btn-danger float-end btn-del">Delete</button><br><code>PS:</code> ${(s.ps||'').trim()} <br><code>RT:</code> ${(s.rt||'').trim().substring(0,120)}</div>`;
+          container.appendChild(div);
+        });
+        Array.from(document.getElementsByClassName('btn-del')).forEach(b => {
+          b.addEventListener('click', (ev) => {
+            const idx = parseInt(ev.target.getAttribute('data-i'));
+            scheduler.splice(idx,1);
+            renderSchedulerList();
+          });
+        });
+      }
+
+      document.getElementById('btn-edit-sched').addEventListener('click', () => {
+        document.getElementById('sched-modal').style.display = 'block';
+        renderSchedulerList();
+      });
+      document.getElementById('btn-close-sched').addEventListener('click', () => {
+        document.getElementById('sched-modal').style.display = 'none';
+      });
+
+      document.getElementById('btn-add-sched').addEventListener('click', () => {
+        const days = document.getElementById('sel-days').value;
+        const start = document.getElementById('inp-start').value || '00:00';
+        const ps = (document.getElementById('inp-ps').value || '').substring(0,8);
+        const rt = (document.getElementById('inp-rt').value || '').substring(0,64);
+        scheduler.push({ days: [days], start_time: start, ps: ps, rt: rt, enabled: true });
+        renderSchedulerList();
+      });
+
+      document.getElementById('btn-save-sched').addEventListener('click', () => {
+        document.getElementById('scheduler-json').value = JSON.stringify(scheduler);
+        document.getElementById('sched-modal').style.display = 'none';
+        // Optionally submit form automatically to save
+        // document.getElementById('mainform').submit();
+      });
+
+      // disable static PS/RT when scheduler enabled
+      function updateStaticFieldsState() {
+        const en = document.getElementById('scheduler-enabled').checked;
+        document.getElementById('static-ps').disabled = en;
+        document.getElementById('static-rt').disabled = en;
+      }
+      document.getElementById('scheduler-enabled').addEventListener('change', updateStaticFieldsState);
+      updateStaticFieldsState();
+
+      // Fetch handlers for LCD buttons
       async function updateLCD(line1, line2) {
         document.getElementById('lcd-line1').textContent = line1 || '';
         document.getElementById('lcd-line2').textContent = line2 || '';
       }
-
       async function fetchPS() {
         const r = await fetch('/display/ps');
         const j = await r.json();
         await updateLCD("PS: " + (j.ps || ""), "");
       }
-
       async function fetchRT() {
         const r = await fetch('/display/rt');
         const j = await r.json();
@@ -690,7 +899,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         const line2 = rt.substring(32, 64);
         await updateLCD(line1, line2);
       }
-
       async function fetchCT() {
         const r = await fetch('/display/ct');
         const j = await r.json();
@@ -701,7 +909,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         const ta = j.ta_enabled ? "TA: ON" : "TA: OFF";
         await updateLCD("CT transmission triggered", ta);
       }
-
       document.getElementById('btn-ps').addEventListener('click', fetchPS);
       document.getElementById('btn-rt').addEventListener('click', fetchRT);
       document.getElementById('btn-ct').addEventListener('click', fetchCT);
@@ -718,6 +925,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
           window.open(window.location.href, '_blank');
         }
       });
+
     </script>
     </body>
     </html>
@@ -726,11 +934,19 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     @app.route("/", methods=["GET"])
     def index():
         cfg = get_config_func()
-        return render_template_string(FORM_HTML, cfg=cfg)
+        # ensure scheduler_json is a JSON serializable string
+        cfg_local = dict(cfg)
+        cfg_local["scheduler_json"] = cfg_local.get("scheduler_entries", [])
+        return render_template_string(FORM_HTML, cfg=cfg_local)
 
     @app.route("/save", methods=["POST"])
     def save():
         form = request.form
+        scheduler_json_str = form.get("scheduler_json", "[]")
+        try:
+            scheduler_entries = json.loads(scheduler_json_str)
+        except Exception:
+            scheduler_entries = []
         cfg = {
             "port": form.get("port", ""),
             "baud": int(form.get("baud", 9600)),
@@ -749,7 +965,9 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             "ct_manual": form.get("ct_manual", ""),
             "ct_omit_offset": bool(form.get("ct_omit_offset")),
             "ct_tp": bool(form.get("ct_tp")),
-            "ct_ta": bool(form.get("ct_ta"))
+            "ct_ta": bool(form.get("ct_ta")),
+            "scheduler_enabled": bool(form.get("scheduler_enabled")),
+            "scheduler_entries": scheduler_entries
         }
         command_queue.put(("apply_config", cfg))
         return redirect(url_for("index"))
@@ -772,16 +990,39 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     @app.route("/display/ps", methods=["GET"])
     def display_ps():
         cfg = get_config_func()
-        ps = cfg.get("ps", "")
-        ps_disp = ps[:16]
-        return jsonify({"ps": ps_disp})
+        # If scheduler enabled and active, show dynamic PS
+        try:
+            if bool(cfg.get("scheduler_enabled", False)):
+                entries = [parse_schedule_entry(e) for e in (cfg.get("scheduler_entries") or [])]
+                active = find_active_schedule_entry(entries)
+                if active:
+                    ps_show = active["ps8"][:8]
+                    return jsonify({"ps": ps_show})
+                else:
+                    return jsonify({"ps": ""})
+            else:
+                ps = cfg.get("ps", "")
+                return jsonify({"ps": ps[:16]})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/display/rt", methods=["GET"])
     def display_rt():
         cfg = get_config_func()
-        rt = cfg.get("rt", "")
-        rt_disp = rt[:64]
-        return jsonify({"rt": rt_disp})
+        try:
+            if bool(cfg.get("scheduler_enabled", False)):
+                entries = [parse_schedule_entry(e) for e in (cfg.get("scheduler_entries") or [])]
+                active = find_active_schedule_entry(entries)
+                if active:
+                    rt_show = active["rt64"][:64]
+                    return jsonify({"rt": rt_show})
+                else:
+                    return jsonify({"rt": ""})
+            else:
+                rt = cfg.get("rt", "")
+                return jsonify({"rt": rt[:64]})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/display/ct", methods=["GET"])
     def display_ct():
@@ -792,33 +1033,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             ct_manual = cfg.get("ct_manual", "") or ""
             ct_offset_cfg = int(cfg.get("ct_offset", 60) or 60)
             ta_enabled = bool(cfg.get("ct_ta", False))
-
-            if ct_omit:
-                now_local = datetime.now().astimezone()
-                dt_for_payload = datetime(now_local.year, now_local.month, now_local.day,
-                                          now_local.hour, now_local.minute, tzinfo=timezone.utc)
-                offset_to_send = 0
-                mode = "omit-offset"
-            elif ct_use_pc:
-                dt_for_payload = datetime.now(timezone.utc)
-                try:
-                    offset_to_send = get_pc_offset_minutes()
-                except Exception:
-                    offset_to_send = ct_offset_cfg
-                mode = "pc-time"
-            else:
-                parsed = parse_manual_ct_datetime(ct_manual)
-                if parsed is not None:
-                    dt_for_payload = parsed
-                    offset_to_send = ct_offset_cfg
-                    mode = "manual"
-                else:
-                    dt_for_payload = datetime.now(timezone.utc)
-                    try:
-                        offset_to_send = get_pc_offset_minutes()
-                    except Exception:
-                        offset_to_send = ct_offset_cfg
-                    mode = "pc-time(fallback)"
 
             return jsonify({
                 "status": "ct_triggered",
@@ -848,6 +1062,9 @@ class App:
         self.stop_event = threading.Event()
         self.worker = None
 
+        # scheduler entries in raw dict format (as saved to config)
+        self.scheduler_entries = []
+
         self.cfg = {
             "port": "",
             "baud": 9600,
@@ -866,7 +1083,9 @@ class App:
             "ct_manual": "",
             "ct_omit_offset": False,
             "ct_tp": False,
-            "ct_ta": False
+            "ct_ta": False,
+            "scheduler_enabled": False,
+            "scheduler_entries": []
         }
 
         self._build_ui()
@@ -922,14 +1141,14 @@ class App:
         self.entry_pi.pack(padx=6, pady=4)
         self.entry_pi.insert(0, "C121")
 
-        gb_ps = ttk.LabelFrame(mid, text="Program Identification (PS)")
+        gb_ps = ttk.LabelFrame(mid, text="Program Identification (PS) — STATIC")
         gb_ps.pack(side=tk.LEFT, padx=6, pady=3, fill=tk.Y)
         ttk.Label(gb_ps, text="PS (max 16 chars):").pack(anchor=tk.W, padx=6, pady=(4,0))
         self.entry_ps = ttk.Entry(gb_ps, width=30)
         self.entry_ps.pack(padx=6, pady=4)
         self.entry_ps.insert(0, "GD-2015")
 
-        gb_rt = ttk.LabelFrame(frm, text="RadioText (RT)")
+        gb_rt = ttk.LabelFrame(frm, text="RadioText (RT) — STATIC")
         gb_rt.pack(fill=tk.BOTH, padx=6, pady=6, expand=True)
         ttk.Label(gb_rt, text="RT (max 64 chars):").pack(anchor=tk.W, padx=6)
         self.text_rt = tk.Text(gb_rt, height=6, wrap=tk.WORD)
@@ -1003,6 +1222,15 @@ class App:
         self.debug_text.pack(fill=tk.BOTH, expand=True)
         self.debug_text.config(state=tk.DISABLED)
 
+        # Scheduler controls
+        gb_sched = ttk.LabelFrame(frm, text="Scheduler (Dynamic RDS)")
+        gb_sched.pack(fill=tk.X, padx=6, pady=6)
+        self.var_scheduler_enabled = tk.BooleanVar(value=False)
+        chk_sched = ttk.Checkbutton(gb_sched, text="Enable Scheduler (dynamic PS/RT)", variable=self.var_scheduler_enabled, command=self._on_scheduler_toggled)
+        chk_sched.pack(side=tk.LEFT, padx=6)
+        self.btn_edit_scheduler = ttk.Button(gb_sched, text="Edit Scheduler...", command=self._open_scheduler_editor)
+        self.btn_edit_scheduler.pack(side=tk.LEFT, padx=6)
+
         self.status_var = tk.StringVar(value="Ready")
         lbl_status = ttk.Label(frm, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         lbl_status.pack(fill=tk.X, padx=6, pady=(4,0))
@@ -1011,6 +1239,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._on_ct_use_pc_changed()
+        self._on_scheduler_toggled()
 
     def open_web(self):
         """Open the Flask web UI in the default browser using the known server port."""
@@ -1142,10 +1371,14 @@ class App:
         ct_omit = bool(self.var_ct_omit.get())
         ct_tp = bool(self.var_tp.get())
         ct_ta = bool(self.var_ta.get())
-        self.worker = RDSWorker(self.ser, self.serial_write_lock, params, self.stop_event, self.status_queue,
-                                ct_enabled=ct_enabled, ct_offset_minutes=ct_offset,
-                                ct_use_pc_time=ct_use_pc_time, ct_manual=ct_manual,
-                                ct_omit_offset=ct_omit, ct_tp=ct_tp, ct_ta=ct_ta)
+        dynamic_enabled = bool(self.var_scheduler_enabled.get())
+        # Pass raw scheduler entries (as saved in config) to worker
+        worker = RDSWorker(self.ser, self.serial_write_lock, params, self.stop_event, self.status_queue,
+                            ct_enabled=ct_enabled, ct_offset_minutes=ct_offset,
+                            ct_use_pc_time=ct_use_pc_time, ct_manual=ct_manual,
+                            ct_omit_offset=ct_omit, ct_tp=ct_tp, ct_ta=ct_ta,
+                            dynamic_scheduler_enabled=dynamic_enabled, scheduler_entries=self.scheduler_entries)
+        self.worker = worker
         self.worker.start()
         self.btn_send.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -1217,7 +1450,9 @@ class App:
             "ct_manual": self.entry_ct_manual.get().strip(),
             "ct_omit_offset": bool(self.var_ct_omit.get()),
             "ct_tp": bool(self.var_tp.get()),
-            "ct_ta": bool(self.var_ta.get())
+            "ct_ta": bool(self.var_ta.get()),
+            "scheduler_enabled": bool(self.var_scheduler_enabled.get()),
+            "scheduler_entries": self.scheduler_entries
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1259,7 +1494,11 @@ class App:
             self.var_ct_omit.set(bool(cfg.get("ct_omit_offset", False)))
             self.var_tp.set(bool(cfg.get("ct_tp", False)))
             self.var_ta.set(bool(cfg.get("ct_ta", False)))
+            self.var_scheduler_enabled.set(bool(cfg.get("scheduler_enabled", False)))
+            # scheduler entries
+            self.scheduler_entries = cfg.get("scheduler_entries", []) or []
             self._on_ct_use_pc_changed()
+            self._on_scheduler_toggled()
             self.status_var.set(f"Config loaded from {CONFIG_FILE}")
             self.cfg.update(cfg)
         except Exception as e:
@@ -1352,7 +1591,12 @@ class App:
                 self.var_tp.set(bool(cfg.get("ct_tp", False)))
             if "ct_ta" in cfg:
                 self.var_ta.set(bool(cfg.get("ct_ta", False)))
+            if "scheduler_enabled" in cfg:
+                self.var_scheduler_enabled.set(bool(cfg.get("scheduler_enabled", False)))
+            if "scheduler_entries" in cfg:
+                self.scheduler_entries = cfg.get("scheduler_entries", []) or []
             self._on_ct_use_pc_changed()
+            self._on_scheduler_toggled()
             self.save_config()
             self.status_var.set("Config updated from web UI and saved")
         except Exception as e:
@@ -1396,9 +1640,107 @@ class App:
             pass
         self.root.destroy()
 
+    # ---------------- Scheduler editor (Tkinter) ----------------
+    def _on_scheduler_toggled(self):
+        enabled = bool(self.var_scheduler_enabled.get())
+        # disable/enable static PS/RT inputs
+        state = "disabled" if enabled else "normal"
+        try:
+            self.entry_ps.config(state=state)
+            self.text_rt.config(state=state)
+        except Exception:
+            pass
+
+    def _open_scheduler_editor(self):
+        win = tk.Toplevel(self.root)
+        win.title("Scheduler Editor")
+        win.geometry("760x480")
+        frm = ttk.Frame(win, padding=6)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        # Listbox to show entries
+        lb = tk.Listbox(frm)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,6))
+
+        def render_listbox():
+            lb.delete(0, tk.END)
+            for i, e in enumerate(self.scheduler_entries):
+                days = e.get("days", [])
+                days_str = ",".join(days) if isinstance(days, list) else str(days)
+                start = e.get("start_time", "00:00")
+                ps = (e.get("ps","") or "").strip()
+                rt = (e.get("rt","") or "").strip()
+                lb.insert(tk.END, f"{i+1}) {days_str} @ {start} PS='{ps}' RT='{rt[:20]}...'")
+
+        render_listbox()
+
+        right = ttk.Frame(frm)
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(right, text="Days:").pack(anchor=tk.W)
+        sel_days = ttk.Combobox(right, values=["mon","tue","wed","thu","fri","sat","sun","weekdays","weekend","all"], state="readonly")
+        sel_days.current(0)
+        sel_days.pack(fill=tk.X, pady=2)
+
+        ttk.Label(right, text="Start (HH:MM):").pack(anchor=tk.W)
+        ent_start = ttk.Entry(right); ent_start.insert(0, "00:00"); ent_start.pack(fill=tk.X, pady=2)
+
+        ttk.Label(right, text="PS (8 chars):").pack(anchor=tk.W)
+        ent_ps = ttk.Entry(right); ent_ps.pack(fill=tk.X, pady=2)
+
+        ttk.Label(right, text="RT (64 chars):").pack(anchor=tk.W)
+        ent_rt = ttk.Entry(right); ent_rt.pack(fill=tk.X, pady=2)
+
+        def add_entry():
+            days_val = sel_days.get()
+            start_val = ent_start.get().strip() or "00:00"
+            ps_val = ent_ps.get().strip()[:8]
+            rt_val = ent_rt.get().strip()[:64]
+            entry = {"days": [days_val], "start_time": start_val, "ps": ps_val, "rt": rt_val, "enabled": True}
+            self.scheduler_entries.append(entry)
+            render_listbox()
+
+        def del_entry():
+            sel = lb.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            del self.scheduler_entries[idx]
+            render_listbox()
+
+        def edit_entry():
+            sel = lb.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            e = self.scheduler_entries[idx]
+            # simple inplace edit using fields
+            e["days"] = e.get("days", [])
+            # prefill fields
+            sel_days.set(e.get("days", ["mon"])[0] if e.get("days") else "mon")
+            ent_start.delete(0, tk.END); ent_start.insert(0, e.get("start_time","00:00"))
+            ent_ps.delete(0, tk.END); ent_ps.insert(0, e.get("ps","")[:8])
+            ent_rt.delete(0, tk.END); ent_rt.insert(0, e.get("rt","")[:64])
+            # remove now; user will modify and press 'Add' to append new one
+            del self.scheduler_entries[idx]
+            render_listbox()
+
+        btn_add = ttk.Button(right, text="Add entry", command=add_entry); btn_add.pack(fill=tk.X, pady=4)
+        btn_edit = ttk.Button(right, text="Edit selected", command=edit_entry); btn_edit.pack(fill=tk.X, pady=4)
+        btn_del = ttk.Button(right, text="Delete selected", command=del_entry); btn_del.pack(fill=tk.X, pady=4)
+
+        def save_and_close():
+            # save config file and close
+            self.save_config()
+            win.destroy()
+
+        btn_close = ttk.Button(right, text="Save & Close", command=save_and_close); btn_close.pack(side=tk.BOTTOM, fill=tk.X, pady=6)
+
+    # ---------------- End scheduler editor ----------------
+
 # ----------------- main -----------------
 def main():
-    parser = argparse.ArgumentParser(description="RDS control (tkinter + Flask) with CT, TP and TA")
+    parser = argparse.ArgumentParser(description="RDS control (tkinter + Flask) with CT, TP and TA and Scheduler")
     parser.add_argument("start", nargs="?", help="use 'start' to autostart sending", default=None)
     parser.add_argument("--port", type=int, help="HTTP server port (default from config or 8080)", default=None)
     args = parser.parse_args()
@@ -1426,7 +1768,9 @@ def main():
             "ct_manual": "",
             "ct_omit_offset": False,
             "ct_tp": False,
-            "ct_ta": False
+            "ct_ta": False,
+            "scheduler_enabled": False,
+            "scheduler_entries": []
         }
         if os.path.exists(CONFIG_FILE):
             try:
