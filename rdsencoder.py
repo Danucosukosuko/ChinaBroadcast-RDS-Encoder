@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
 
 import sys
 import os
@@ -8,20 +11,31 @@ import time
 import queue
 import argparse
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
-from datetime import datetime, timezone, timedelta
-
+from datetime import datetime, timezone
 import webbrowser
 import serial
 import serial.tools.list_ports
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
-
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
+import urllib.request
+import subprocess
+import logging
 
+# ---------- Logging ----------
+logger = logging.getLogger("pyrds")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+
+# ---------- Constants ----------
 CONFIG_FILE = "config.json"
 DEFAULT_HTTP_PORT = 8080
+API_PORT = 16590  # API port requested by user
 
 PTY_TABLE = [
     ("0008", "None"),
@@ -64,7 +78,7 @@ def replace_char(s: str, index: int, newchar: str) -> str:
     lst[index] = newchar
     return "".join(lst)
 
-def pad_or_truncate(s: str, length: int, pad_char: str = " ") -> str:
+def pad_or_truncate(s: Optional[str], length: int, pad_char: str = " ") -> str:
     if s is None:
         s = ""
     return s.ljust(length, pad_char)[:length]
@@ -74,15 +88,24 @@ def encode_gb2312_two_bytes(twochars: str) -> bytes:
     try:
         b = t.encode("gb2312", errors="replace")
     except Exception:
-        b = t.encode("utf-8", errors="replace")
+        try:
+            b = t.encode("utf-8", errors="replace")
+        except Exception:
+            b = t.encode("latin-1", errors="replace")
     if len(b) < 2:
         b = b.ljust(2, b" ")
     return b[:2]
 
 def to_hex_byte(hexstr: str) -> int:
-    if hexstr is None or len(hexstr) < 2:
-        raise ValueError("hex string too short")
-    return int(hexstr, 16)
+    if hexstr is None:
+        raise ValueError("hex string is None")
+    s = str(hexstr).strip()
+    if len(s) < 2:
+        raise ValueError(f"hex string too short: '{hexstr}'")
+    try:
+        return int(s, 16) & 0xFF
+    except ValueError as e:
+        raise ValueError(f"Invalid hex string '{hexstr}': {e}")
 
 def hex_dump(buffer: bytes) -> str:
     return " ".join(f"{b:02X}" for b in buffer)
@@ -161,7 +184,7 @@ def get_pc_offset_minutes() -> int:
         return 0
     return int(offs.total_seconds() // 60)
 
-# ----------------- Helper to build group 0A with TA -----------------
+# ----------------- RDS group 0A helpers -----------------
 def make_rds_group0a_frame(pi_hex: str, tp: int = 0, pty: int = 0, ta: int = 0, ps_bytes_pair=(b' ', b' ')) -> bytes:
     GROUP_TYPE = 0
     VERSION_A = 0
@@ -185,6 +208,49 @@ def make_rds_group0a_frame(pi_hex: str, tp: int = 0, pty: int = 0, ta: int = 0, 
     frame = bytes([pi_hi, pi_lo, b2_hi, b2_lo, b3_hi, b3_lo, b4_hi, b4_lo, 0x0A])
     return frame
 
+def make_rds_group0a_af_frame(pi_hex: str, af_byte_a: int, af_byte_b: int, tp: int = 0, pty: int = 0, ta: int = 0, ps_bytes_pair=(b' ', b' ')) -> bytes:
+    GROUP_TYPE = 0
+    VERSION_A = 0
+    top2 = 0
+    block3 = ((af_byte_a & 0xFF) << 8) | (af_byte_b & 0xFF)
+    block4 = (ps_bytes_pair[1][0] << 8) | (ps_bytes_pair[1][1] & 0xFF)
+
+    block2_base = (GROUP_TYPE << 12) | (VERSION_A << 11) | ((tp & 0x1) << 10) | ((pty & 0x1F) << 5) | ((ta & 0x1) << 4)
+    block2 = block2_base | (top2 & 0x3)
+
+    pi_val = int(pi_hex, 16) & 0xFFFF
+    pi_hi = (pi_val >> 8) & 0xFF
+    pi_lo = pi_val & 0xFF
+    b2_hi = (block2 >> 8) & 0xFF
+    b2_lo = block2 & 0xFF
+    b3_hi = (block3 >> 8) & 0xFF
+    b3_lo = block3 & 0xFF
+    b4_hi = (block4 >> 8) & 0xFF
+    b4_lo = block4 & 0xFF
+
+    frame = bytes([pi_hi, pi_lo, b2_hi, b2_lo, b3_hi, b3_lo, b4_hi, b4_lo, 0x0A])
+    return frame
+
+# ----------------- AF frequency helpers -----------------
+def freq_to_af_code(freq_str: str) -> int:
+    if freq_str is None:
+        raise ValueError("Empty freq")
+    s = str(freq_str).strip().replace(",", ".")
+    try:
+        f = float(s)
+    except Exception:
+        raise ValueError(f"Invalid frequency: {freq_str}")
+    if 87.6 <= f <= 107.9:
+        code = int(round((f - 87.5) * 10))
+        if code < 1:
+            code = 1
+        if code > 204:
+            code = 204
+        return code
+    if f < 87.5:
+        return 250
+    raise ValueError(f"Frequency out of supported range for AF method A: {f}")
+
 # ----------------- Data classes -----------------
 @dataclass
 class RDSParams:
@@ -196,17 +262,6 @@ class RDSParams:
 
 # ----------------- Scheduler helpers -----------------
 def parse_schedule_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize a raw schedule entry dict into internal structure:
-    {
-      "days": [0..6],  # Monday=0 ... Sunday=6
-      "start_min": int (minutes from midnight),
-      "ps8": str,
-      "rt64": str,
-      "enabled": bool
-    }
-    raw can have days as ['mon','tue'] or 'weekdays' or 'weekend'
-    """
     days_src = raw.get("days", [])
     days_norm = []
 
@@ -235,7 +290,6 @@ def parse_schedule_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
             days_norm.extend([5,6])
         elif dd in ("all", "everyday", "todos"):
             days_norm.extend([0,1,2,3,4,5,6])
-    # dedupe and sort
     days_norm = sorted(set(days_norm))
 
     start = raw.get("start_time", "00:00")
@@ -248,7 +302,7 @@ def parse_schedule_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
     ps8 = raw.get("ps", "") or ""
     if len(ps8) > 8:
         ps8 = ps8[:8]
-    ps8 = ps8.ljust(8)  # keep length 8
+    ps8 = ps8.ljust(8)
 
     rt64 = raw.get("rt", "") or ""
     if len(rt64) > 64:
@@ -257,38 +311,28 @@ def parse_schedule_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     enabled = bool(raw.get("enabled", True))
 
-    return {"days": days_norm, "start_min": start_min, "ps8": ps8, "rt64": rt64, "enabled": enabled}
+    return {"days": days_norm, "start_min": start_min, "ps8": ps8, "rt64": rt64, "enabled": enabled, "start_time": start}
 
 def find_active_schedule_entry(entries: List[Dict[str, Any]], when: Optional[datetime]=None) -> Optional[Dict[str, Any]]:
-    """
-    entries: already normalized via parse_schedule_entry
-    returns the entry with latest start_min <= now for today, among enabled ones,
-    or None if no matching entry.
-    """
     if when is None:
         when = datetime.now().astimezone()
-    today_idx = (when.weekday())  # Monday=0 .. Sunday=6
+    today_idx = (when.weekday())
     now_min = when.hour * 60 + when.minute
 
-    # Filter to entries that include today and are enabled
     candidates = []
     for e in entries:
         if not e.get("enabled", True):
             continue
         if today_idx in e.get("days", []):
-            # find the latest start <= now
             if e.get("start_min", 0) <= now_min:
                 candidates.append(e)
 
     if not candidates:
         return None
-    # choose candidate with largest start_min
     candidates.sort(key=lambda x: x.get("start_min", 0), reverse=True)
     return candidates[0]
 
 def ps8_to_ps16(ps8: str) -> str:
-    """Convert an 8-char PS into the 16-char used by the rest of the code.
-       We'll duplicate the 8 chars to form 16 (PS halves identical) — common technique."""
     ps8 = ps8[:8].ljust(8)
     return ps8 + ps8
 
@@ -299,7 +343,8 @@ class RDSWorker(threading.Thread):
                  ct_enabled: bool = False, ct_offset_minutes: int = 60,
                  ct_use_pc_time: bool = True, ct_manual: str = "",
                  ct_omit_offset: bool = False, ct_tp: bool = False, ct_ta: bool = False,
-                 dynamic_scheduler_enabled: bool = False, scheduler_entries: Optional[List[Dict[str, Any]]] = None):
+                 dynamic_scheduler_enabled: bool = False, scheduler_entries: Optional[List[Dict[str, Any]]] = None,
+                 alt_freqs: Optional[List[Dict[str,str]]] = None):
         super().__init__(daemon=True)
         self.ser = ser
         self.write_lock = write_lock
@@ -315,9 +360,10 @@ class RDSWorker(threading.Thread):
         self.ct_ta = bool(ct_ta)
 
         self.dynamic_scheduler_enabled = bool(dynamic_scheduler_enabled)
-        # scheduler_entries: list of normalized entries (parse_schedule_entry)
         self.scheduler_entries = [parse_schedule_entry(e) for e in (scheduler_entries or [])]
 
+        # alt_freqs: list of dicts {'freq': '98.3', 'label': '...'}. Cap to 25 for Method A.
+        self.alt_freqs = (alt_freqs or [])[:25]
         self._ct_thread = None
 
     def run(self):
@@ -450,7 +496,6 @@ class RDSWorker(threading.Thread):
             self.q_status.put(("debug", f"Failed to send TA group: {e}"))
 
     def _build_ps_rt_bytes_for_dynamic(self, ps8: str, rt64: str):
-        # ps8 -> ps16 duplicated
         ps16 = ps8_to_ps16(ps8)
         PSparts = [ps16[i:i+2] for i in range(0, 16, 2)]
         PS_bytes = [encode_gb2312_two_bytes(p) for p in PSparts]
@@ -458,14 +503,37 @@ class RDSWorker(threading.Thread):
         RT_bytes = [encode_gb2312_two_bytes(p) for p in RTparts]
         return PS_bytes, RT_bytes
 
+    def _build_af_pairs_from_altfreqs(self, alt_freqs: List[Dict[str, str]], PS_bytes_static):
+        af_codes = []
+        parsed_freqs = []
+        for f in alt_freqs:
+            freq_raw = f.get("freq") if isinstance(f, dict) else f
+            try:
+                code = freq_to_af_code(freq_raw)
+                af_codes.append(code)
+                parsed_freqs.append(str(freq_raw))
+            except Exception:
+                self.q_status.put(("debug", f"AF parse skip: {freq_raw}"))
+        if len(af_codes) == 0:
+            return []
+
+        if len(af_codes) > 25:
+            af_codes = af_codes[:25]
+            self.q_status.put(("status", "AF list truncated to 25 entries (Method A limit)."))
+        n = len(af_codes)
+        count_code = 224 + n  # 225..249 represent 1..25 AFs
+        seq = [count_code] + af_codes
+        if len(seq) % 2 != 0:
+            seq.append(205)  # filler code
+        pairs = [(seq[i], seq[i+1]) for i in range(0, len(seq), 2)]
+        return pairs
+
     def _send_loop(self):
-        # Prepare static slices for fallback (if not dynamic or used elsewhere)
         static_slices = self._prepare_slices_static()
 
         if not self.ser.is_open:
             raise RuntimeError("Serial port not open")
 
-        # Pre-calc static bytes (used when scheduler disabled)
         PS_bytes_static = [encode_gb2312_two_bytes(p) for p in static_slices["PSparts"]]
         RT_bytes_static = [encode_gb2312_two_bytes(p) for p in static_slices["RTparts"]]
 
@@ -543,7 +611,6 @@ class RDSWorker(threading.Thread):
                     time.sleep(0.1)
             return True
 
-        # If CT enabled, send initial CT and start thread
         last_minute_sent = None
         if self.ct_enabled:
             try:
@@ -562,41 +629,54 @@ class RDSWorker(threading.Thread):
         if self.ct_enabled:
             self._start_ct_thread()
 
-        # Main loop: either use static PS/RT or dynamic scheduled PS/RT
         while not self.stop_event.is_set():
-            # Determine whether to use dynamic scheduler
             if self.dynamic_scheduler_enabled:
                 active = find_active_schedule_entry(self.scheduler_entries, when=datetime.now().astimezone())
                 if active:
-                    # build PS/RT bytes from active
-                    PS_bytes = []
-                    RT_bytes = []
                     PS_bytes, RT_bytes = self._build_ps_rt_bytes_for_dynamic(active["ps8"], active["rt64"])
-                    # Send TA if enabled
                     if self.ct_ta:
                         try:
                             self._send_group0a_ta(PS_bytes)
                         except Exception:
                             pass
-                    # send PS loop
                     ok = send_ps_loop(PS_bytes)
                     if not ok:
                         break
-                    # send RT loop
                     ok = send_rt_loop(RT_bytes, RTAadd2_b)
                     if not ok:
                         break
                 else:
-                    # No active schedule entry for now -> skip PS/RT (only wait a bit, keep CT thread running)
                     self.q_status.put(("status", "Scheduler active but no entry for current time - skipping PS/RT"))
-                    # wait some seconds before checking again
                     for _ in range(30):
                         if self.stop_event.is_set():
                             break
                         time.sleep(1.0)
                     continue
             else:
-                # Static behavior (old behavior)
+                if self.alt_freqs:
+                    try:
+                        af_pairs = self._build_af_pairs_from_altfreqs(self.alt_freqs, PS_bytes_static)
+                        if af_pairs:
+                            self.q_status.put(("status", f"Sending AF list ({len(self.alt_freqs)} entries, capped at 25 for Method A)"))
+                            for idx, (a,b) in enumerate(af_pairs):
+                                if self.stop_event.is_set():
+                                    break
+                                try:
+                                    ps_pair_to_use = (PS_bytes_static[0] if len(PS_bytes_static)>0 else b"  ",
+                                                      PS_bytes_static[1] if len(PS_bytes_static)>1 else b"  ")
+                                    frame = make_rds_group0a_af_frame(self.params.GJ_input, a, b, tp=int(bool(self.ct_tp)), pty=0, ta=0, ps_bytes_pair=ps_pair_to_use)
+                                    self._safe_write(frame)
+                                    self.q_status.put(("debug", f"AF pair {idx+1}/{len(af_pairs)} -> {hex_dump(frame)}"))
+                                    self.q_status.put(("status", f"AF packet {idx+1}/{len(af_pairs)} sent."))
+                                except Exception as e:
+                                    self.q_status.put(("debug", f"AF send failed: {e}"))
+                                for _ in range(3):
+                                    if self.stop_event.is_set():
+                                        break
+                                    time.sleep(0.1)
+                    except Exception as e:
+                        self.q_status.put(("debug", f"AF processing failed: {e}"))
+
                 if self.ct_ta:
                     try:
                         self._send_group0a_ta(PS_bytes_static)
@@ -611,7 +691,7 @@ class RDSWorker(threading.Thread):
 
         self.q_status.put(("status", "Stop requested; finishing worker."))
 
-# ----------------- Flask server -----------------
+# ----------------- Flask server (web UI) -----------------
 def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_config_func):
     app = Flask("pyrds_web_ct_pc_toggle")
 
@@ -620,7 +700,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     <html>
     <head>
       <meta charset="utf-8">
-      <title>RDS Control - Web (CT / TP / TA / Scheduler)</title>
+      <title>RDS Control - Web (CT / TP / TA / Scheduler / AltFreqs)</title>
       <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
       <style>
         .lcd {
@@ -763,12 +843,26 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             <a class="btn btn-success" href="/start">Start</a>
             <a class="btn btn-danger" href="/stop">Stop</a>
             <a class="btn btn-secondary" href="/status">Status (JSON)</a>
+            <a class="btn btn-warning" href="/restart" onclick="return confirm('Restart application now?');">Restart</a>
+            <button type="button" class="btn btn-info" id="btn-altfreqs">Alt Frequencies</button>
             <button type="button" class="btn btn-outline-info" id="btn-edit-sched">Edit Scheduler</button>
           </div>
         </div>
 
-        <!-- Hidden field with scheduler JSON -->
-        <input type="hidden" id="scheduler-json" name="scheduler_json" value='{{cfg.scheduler_json|tojson|safe}}'>
+        <!-- API password field -->
+        <div class="row mt-2">
+          <div class="col-md-4">
+            <label class="form-label">API password (for JSON API)</label>
+            <input name="api_password" type="password" class="form-control" value="{{cfg.api_password or ''}}">
+          </div>
+          <div class="col-md-8 small-note">
+            The JSON API on port 16590 requires this password. Keep it secret.
+          </div>
+        </div>
+
+        <!-- Hidden fields -->
+        <input type="hidden" id="scheduler-json" name="scheduler_json" value='{{cfg.scheduler_entries|tojson|safe}}'>
+        <input type="hidden" id="alt-freqs-json" name="alt_freqs_json" value='{{cfg.alt_freqs|tojson|safe}}'>
       </form>
 
       <!-- Scheduler modal (simple) -->
@@ -818,9 +912,40 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         </div>
       </div>
 
+      <!-- Alt Frequencies modal -->
+      <div class="modal" tabindex="-1" id="altfreq-modal" style="display:none; position:fixed; left:0; top:0; right:0; bottom:0; background: rgba(0,0,0,0.4);">
+        <div style="max-width:720px; margin: 40px auto; background:white; padding:12px; border-radius:6px;">
+          <h5>Alternative Frequencies (AF)</h5>
+          <p class="small-note">Add alternative frequencies that will be saved in the configuration (Method A, up to 25 AFs).</p>
+          <div class="row g-2 align-items-end">
+            <div class="col-md-5">
+              <label>Frequency (MHz)</label>
+              <input id="afreq-input" class="form-control" placeholder="e.g. 98.3">
+            </div>
+            <div class="col-md-5">
+              <label>Label (optional)</label>
+              <input id="afreq-label" class="form-control" placeholder="e.g. North Repeater">
+            </div>
+            <div class="col-md-2">
+              <label>&nbsp;</label>
+              <button id="btn-add-afreq" class="btn btn-primary w-100">Add</button>
+            </div>
+          </div>
+
+          <hr>
+          <div id="afreq-list" style="max-height:260px; overflow:auto;"></div>
+
+          <div class="mt-3 d-flex justify-content-end">
+            <button id="btn-save-afreqs" class="btn btn-success me-2">Save frequencies</button>
+            <button id="btn-close-afreqs" class="btn btn-secondary">Close</button>
+          </div>
+        </div>
+      </div>
+
     </div>
 
     <script>
+      // Scheduler JS (kept)
       let scheduler = [];
       try {
         const raw = document.getElementById('scheduler-json').value;
@@ -868,8 +993,82 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
       document.getElementById('btn-save-sched').addEventListener('click', () => {
         document.getElementById('scheduler-json').value = JSON.stringify(scheduler);
         document.getElementById('sched-modal').style.display = 'none';
-        // Optionally submit form automatically to save
-        // document.getElementById('mainform').submit();
+      });
+
+      // Alt Frequencies JS
+      let altfreqs = [];
+      try {
+        const raw = document.getElementById('alt-freqs-json').value;
+        if (raw) altfreqs = JSON.parse(raw);
+      } catch(e) {
+        altfreqs = [];
+      }
+
+      function renderAltFreqs() {
+        const container = document.getElementById('afreq-list');
+        container.innerHTML = '';
+        if (!altfreqs || altfreqs.length === 0) {
+          container.innerHTML = '<div class="alert alert-secondary">No alternative frequencies added.</div>';
+          return;
+        }
+        altfreqs.forEach((f, i) => {
+          const row = document.createElement('div');
+          row.className = 'd-flex align-items-center mb-2';
+          const info = document.createElement('div');
+          info.className = 'flex-grow-1';
+          info.innerHTML = `<strong>${f.freq}</strong> MHz <small class="text-muted">- ${f.label || ''}</small>`;
+          const btns = document.createElement('div');
+          btns.innerHTML = `<button data-i="${i}" class="btn btn-sm btn-danger btn-del-afreq me-2">Remove</button><button data-i="${i}" class="btn btn-sm btn-secondary btn-edit-afreq">Edit</button>`;
+          row.appendChild(info);
+          row.appendChild(btns);
+          container.appendChild(row);
+        });
+
+        Array.from(document.getElementsByClassName('btn-del-afreq')).forEach(b => {
+          b.addEventListener('click', (ev) => {
+            const idx = parseInt(ev.target.getAttribute('data-i'));
+            altfreqs.splice(idx, 1);
+            renderAltFreqs();
+          });
+        });
+        Array.from(document.getElementsByClassName('btn-edit-afreq')).forEach(b => {
+          b.addEventListener('click', (ev) => {
+            const idx = parseInt(ev.target.getAttribute('data-i'));
+            const f = altfreqs[idx];
+            document.getElementById('afreq-input').value = f.freq;
+            document.getElementById('afreq-label').value = f.label || '';
+            // delete original; user will press 'Add' to append (simple flow)
+            altfreqs.splice(idx, 1);
+            renderAltFreqs();
+          });
+        });
+      }
+
+      document.getElementById('btn-altfreqs').addEventListener('click', () => {
+        document.getElementById('altfreq-modal').style.display = 'block';
+        renderAltFreqs();
+      });
+      document.getElementById('btn-close-afreqs').addEventListener('click', () => {
+        document.getElementById('altfreq-modal').style.display = 'none';
+      });
+
+      document.getElementById('btn-add-afreq').addEventListener('click', () => {
+        const f = document.getElementById('afreq-input').value.trim();
+        const label = document.getElementById('afreq-label').value.trim();
+        if (!f) {
+          alert('Please enter a valid frequency (e.g. 98.3)');
+          return;
+        }
+        const freq_norm = f.replace(',', '.');
+        altfreqs.push({ freq: freq_norm, label: label });
+        document.getElementById('afreq-input').value = '';
+        document.getElementById('afreq-label').value = '';
+        renderAltFreqs();
+      });
+
+      document.getElementById('btn-save-afreqs').addEventListener('click', () => {
+        document.getElementById('alt-freqs-json').value = JSON.stringify(altfreqs);
+        document.getElementById('altfreq-modal').style.display = 'none';
       });
 
       // disable static PS/RT when scheduler enabled
@@ -934,9 +1133,9 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     @app.route("/", methods=["GET"])
     def index():
         cfg = get_config_func()
-        # ensure scheduler_json is a JSON serializable string
         cfg_local = dict(cfg)
-        cfg_local["scheduler_json"] = cfg_local.get("scheduler_entries", [])
+        cfg_local["scheduler_entries"] = cfg_local.get("scheduler_entries", [])
+        cfg_local["alt_freqs"] = cfg_local.get("alt_freqs", [])
         return render_template_string(FORM_HTML, cfg=cfg_local)
 
     @app.route("/save", methods=["POST"])
@@ -947,6 +1146,12 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             scheduler_entries = json.loads(scheduler_json_str)
         except Exception:
             scheduler_entries = []
+        alt_freqs_str = form.get("alt_freqs_json", "[]")
+        try:
+            alt_freqs = json.loads(alt_freqs_str)
+        except Exception:
+            alt_freqs = []
+
         cfg = {
             "port": form.get("port", ""),
             "baud": int(form.get("baud", 9600)),
@@ -967,7 +1172,9 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             "ct_tp": bool(form.get("ct_tp")),
             "ct_ta": bool(form.get("ct_ta")),
             "scheduler_enabled": bool(form.get("scheduler_enabled")),
-            "scheduler_entries": scheduler_entries
+            "scheduler_entries": scheduler_entries,
+            "alt_freqs": alt_freqs,
+            "api_password": form.get("api_password", "")
         }
         command_queue.put(("apply_config", cfg))
         return redirect(url_for("index"))
@@ -982,6 +1189,11 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         command_queue.put(("stop", None))
         return redirect(url_for("index"))
 
+    @app.route("/restart", methods=["GET", "POST"])
+    def restart_route():
+        command_queue.put(("restart", None))
+        return redirect(url_for("index"))
+
     @app.route("/status", methods=["GET"])
     def status_route():
         cfg = get_config_func()
@@ -990,7 +1202,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     @app.route("/display/ps", methods=["GET"])
     def display_ps():
         cfg = get_config_func()
-        # If scheduler enabled and active, show dynamic PS
         try:
             if bool(cfg.get("scheduler_enabled", False)):
                 entries = [parse_schedule_entry(e) for e in (cfg.get("scheduler_entries") or [])]
@@ -1028,18 +1239,76 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
     def display_ct():
         cfg = get_config_func()
         try:
-            ct_omit = bool(cfg.get("ct_omit_offset", False))
-            ct_use_pc = bool(cfg.get("ct_use_pc_time", True))
-            ct_manual = cfg.get("ct_manual", "") or ""
-            ct_offset_cfg = int(cfg.get("ct_offset", 60) or 60)
             ta_enabled = bool(cfg.get("ct_ta", False))
-
             return jsonify({
                 "status": "ct_triggered",
                 "ta_enabled": ta_enabled
             })
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+    @app.route("/_shutdown", methods=["GET"])
+    def shutdown_route():
+        func = request.environ.get('werkzeug.server.shutdown')
+        if func is None:
+            return "No shutdown function available (not running under Werkzeug?)", 500
+        func()
+        return "Server shutting down..."
+
+    return app
+
+# ----------------- JSON API (auth) -----------------
+def create_api_app(command_queue: queue.Queue, status_queue: queue.Queue, get_config_func):
+    """
+    Minimal JSON API on 0.0.0.0:16590
+    POST /api/control
+    Body (JSON):
+    {
+      "password": "xxx",
+      "cmd": "set"|"clear"|"stop"|"status",
+      "ps": "PSVALUE",      optional for 'set'
+      "rt": "RT text"       optional for 'set'
+    }
+    """
+    app = Flask("pyrds_api")
+
+    @app.route("/api/control", methods=["POST"])
+    def api_control():
+        if not request.is_json:
+            return jsonify({"error": "JSON required"}), 400
+        data = request.get_json()
+        pwd = data.get("password")
+        cmd = (data.get("cmd") or "").strip().lower()
+        if not pwd or not cmd:
+            return jsonify({"error": "password and cmd required"}), 400
+
+        cfg = get_config_func()
+        configured_pwd = cfg.get("api_password", "") or ""
+        # Validate password
+        if configured_pwd == "":
+            return jsonify({"error": "API password not configured on server"}), 403
+        if pwd != configured_pwd:
+            return jsonify({"error": "invalid password"}), 403
+
+        # Auth ok -> handle commands by putting into command_queue for the Tk app to handle
+        if cmd == "set":
+            ps = data.get("ps", "")
+            rt = data.get("rt", "")
+            # push override command
+            command_queue.put(("api_set_override", {"ps": ps, "rt": rt}))
+            return jsonify({"result": "override_set", "ps": ps, "rt": rt})
+        elif cmd == "clear":
+            command_queue.put(("api_clear_override", None))
+            return jsonify({"result": "override_cleared"})
+        elif cmd == "stop":
+            command_queue.put(("api_stop_override", None))
+            return jsonify({"result": "stopped"})
+        elif cmd == "status":
+            # Provide immediate status from config snapshot
+            # Also enqueue a "query" if UI wants to push live statuses via status_queue (not necessary)
+            return jsonify({"result": "ok", "config": cfg})
+        else:
+            return jsonify({"error": "unknown cmd"}), 400
 
     return app
 
@@ -1060,10 +1329,14 @@ class App:
         self.serial_write_lock = threading.Lock()
 
         self.stop_event = threading.Event()
-        self.worker = None
+        self.worker: Optional[RDSWorker] = None
 
-        # scheduler entries in raw dict format (as saved to config)
         self.scheduler_entries = []
+        self.alt_freqs = []  # persisted alternative frequencies
+
+        # For API override handling
+        self.api_override_active = False
+        self._api_prev_state: Optional[Dict[str, Any]] = None  # saved state to restore later
 
         self.cfg = {
             "port": "",
@@ -1085,7 +1358,9 @@ class App:
             "ct_tp": False,
             "ct_ta": False,
             "scheduler_enabled": False,
-            "scheduler_entries": []
+            "scheduler_entries": [],
+            "alt_freqs": [],
+            "api_password": ""
         }
 
         self._build_ui()
@@ -1115,7 +1390,6 @@ class App:
         self.btn_open.pack(side=tk.LEFT, padx=(0,8))
         self.btn_savecfg = ttk.Button(row, text="Save Config", command=self.save_config)
         self.btn_savecfg.pack(side=tk.LEFT, padx=(0,8))
-        # New: LINK TO WEB button in the Tkinter window
         self.btn_link_tk = ttk.Button(row, text="LINK TO WEB", command=self.open_web)
         self.btn_link_tk.pack(side=tk.LEFT, padx=(0,8))
         self.led_canvas = tk.Canvas(row, width=14, height=14, highlightthickness=0)
@@ -1169,6 +1443,8 @@ class App:
         self.btn_send.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,4))
         self.btn_stop = ttk.Button(btns, text="Stop", command=self.stop_sending, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4,0))
+        self.btn_restart = ttk.Button(btns, text="Restart", command=self._on_restart)
+        self.btn_restart.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=(8,0))
 
         gb_ct = ttk.LabelFrame(frm, text="CT (Clock Time) & Traffic flags")
         gb_ct.pack(fill=tk.X, padx=6, pady=6)
@@ -1201,6 +1477,7 @@ class App:
         chk_ta = ttk.Checkbutton(gb_ct, text="TA (Traffic Announcement)", variable=self.var_ta)
         chk_ta.pack(side=tk.LEFT, padx=(12,6))
 
+        # Debug & Scheduler UI
         gb_debugctrl = ttk.LabelFrame(frm, text="Debug")
         gb_debugctrl.pack(fill=tk.X, padx=6, pady=6)
         self.var_debug = tk.BooleanVar(value=False)
@@ -1222,7 +1499,6 @@ class App:
         self.debug_text.pack(fill=tk.BOTH, expand=True)
         self.debug_text.config(state=tk.DISABLED)
 
-        # Scheduler controls
         gb_sched = ttk.LabelFrame(frm, text="Scheduler (Dynamic RDS)")
         gb_sched.pack(fill=tk.X, padx=6, pady=6)
         self.var_scheduler_enabled = tk.BooleanVar(value=False)
@@ -1230,6 +1506,12 @@ class App:
         chk_sched.pack(side=tk.LEFT, padx=6)
         self.btn_edit_scheduler = ttk.Button(gb_sched, text="Edit Scheduler...", command=self._open_scheduler_editor)
         self.btn_edit_scheduler.pack(side=tk.LEFT, padx=6)
+
+        # small view for alternative frequencies in the Tk UI (persisted but editable only via web)
+        gb_alt = ttk.LabelFrame(frm, text="Alternative Frequencies (stored in config)")
+        gb_alt.pack(fill=tk.X, padx=6, pady=6)
+        self.lbl_alt_preview = ttk.Label(gb_alt, text="(Manage using the web UI)")
+        self.lbl_alt_preview.pack(anchor=tk.W, padx=6, pady=6)
 
         self.status_var = tk.StringVar(value="Ready")
         lbl_status = ttk.Label(frm, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
@@ -1242,7 +1524,6 @@ class App:
         self._on_scheduler_toggled()
 
     def open_web(self):
-        """Open the Flask web UI in the default browser using the known server port."""
         try:
             url = f"http://127.0.0.1:{self.http_port}/"
             webbrowser.open_new_tab(url)
@@ -1331,6 +1612,7 @@ class App:
         return RDSParams(FGdata=FGdata, GJ_input=GJ_input, PS_input=PS_input, RT_input=RT_input, RTaddress=RTaddress)
 
     def start_sending(self):
+        # start or restart worker according to current UI config
         if not self.ser.is_open:
             port = self.combo_ports.get()
             if port:
@@ -1372,12 +1654,13 @@ class App:
         ct_tp = bool(self.var_tp.get())
         ct_ta = bool(self.var_ta.get())
         dynamic_enabled = bool(self.var_scheduler_enabled.get())
-        # Pass raw scheduler entries (as saved in config) to worker
+
         worker = RDSWorker(self.ser, self.serial_write_lock, params, self.stop_event, self.status_queue,
                             ct_enabled=ct_enabled, ct_offset_minutes=ct_offset,
                             ct_use_pc_time=ct_use_pc_time, ct_manual=ct_manual,
                             ct_omit_offset=ct_omit, ct_tp=ct_tp, ct_ta=ct_ta,
-                            dynamic_scheduler_enabled=dynamic_enabled, scheduler_entries=self.scheduler_entries)
+                            dynamic_scheduler_enabled=dynamic_enabled, scheduler_entries=self.scheduler_entries,
+                            alt_freqs=self.alt_freqs)
         self.worker = worker
         self.worker.start()
         self.btn_send.config(state=tk.DISABLED)
@@ -1452,7 +1735,9 @@ class App:
             "ct_tp": bool(self.var_tp.get()),
             "ct_ta": bool(self.var_ta.get()),
             "scheduler_enabled": bool(self.var_scheduler_enabled.get()),
-            "scheduler_entries": self.scheduler_entries
+            "scheduler_entries": self.scheduler_entries,
+            "alt_freqs": self.alt_freqs,
+            "api_password": self.cfg.get("api_password", "")
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1495,8 +1780,20 @@ class App:
             self.var_tp.set(bool(cfg.get("ct_tp", False)))
             self.var_ta.set(bool(cfg.get("ct_ta", False)))
             self.var_scheduler_enabled.set(bool(cfg.get("scheduler_enabled", False)))
-            # scheduler entries
             self.scheduler_entries = cfg.get("scheduler_entries", []) or []
+            self.alt_freqs = cfg.get("alt_freqs", []) or []
+            try:
+                self.cfg["api_password"] = cfg.get("api_password", "")
+            except Exception:
+                pass
+            # update preview label (simple)
+            try:
+                if self.alt_freqs:
+                    self.lbl_alt_preview.config(text=", ".join([f['freq'] for f in self.alt_freqs]))
+                else:
+                    self.lbl_alt_preview.config(text="(Manage using the web UI)")
+            except Exception:
+                pass
             self._on_ct_use_pc_changed()
             self._on_scheduler_toggled()
             self.status_var.set(f"Config loaded from {CONFIG_FILE}")
@@ -1505,6 +1802,7 @@ class App:
             self.status_var.set(f"Load config failed: {e}")
 
     def _periodic_check(self):
+        # Read status_queue
         try:
             while True:
                 typ, msg = self.status_queue.get_nowait()
@@ -1531,6 +1829,7 @@ class App:
         except queue.Empty:
             pass
 
+        # Read command_queue from Flask/API threads
         try:
             while True:
                 cmd, payload = self.command_queue.get_nowait()
@@ -1540,6 +1839,18 @@ class App:
                     self.start_sending()
                 elif cmd == "stop":
                     self.stop_sending()
+                elif cmd == "restart":
+                    self.status_var.set("Restart requested...")
+                    self.root.after(100, self._do_restart)
+                elif cmd == "api_set_override":
+                    # payload: {"ps": "...", "rt": "..."}
+                    ps = (payload.get("ps") or "")[:64]
+                    rt = (payload.get("rt") or "")[:1024]
+                    self._apply_api_override(ps=ps, rt=rt)
+                elif cmd == "api_clear_override":
+                    self._clear_api_override()
+                elif cmd == "api_stop_override":
+                    self._api_stop_override()
                 else:
                     pass
         except queue.Empty:
@@ -1595,6 +1906,17 @@ class App:
                 self.var_scheduler_enabled.set(bool(cfg.get("scheduler_enabled", False)))
             if "scheduler_entries" in cfg:
                 self.scheduler_entries = cfg.get("scheduler_entries", []) or []
+            if "alt_freqs" in cfg:
+                self.alt_freqs = cfg.get("alt_freqs", []) or []
+                try:
+                    if self.alt_freqs:
+                        self.lbl_alt_preview.config(text=", ".join([f['freq'] for f in self.alt_freqs]))
+                    else:
+                        self.lbl_alt_preview.config(text="(Manage using the web UI)")
+                except Exception:
+                    pass
+            if "api_password" in cfg:
+                self.cfg["api_password"] = cfg.get("api_password", "")
             self._on_ct_use_pc_changed()
             self._on_scheduler_toggled()
             self.save_config()
@@ -1602,6 +1924,105 @@ class App:
         except Exception as e:
             self.status_var.set(f"Apply remote config failed: {e}")
 
+    # ---------------- API override helpers ----------------
+    def _apply_api_override(self, ps: str, rt: str):
+        """
+        Called when API requests to set PS/RT override.
+        Saves previous state, disables scheduler, sets PS/RT to provided values and (re)starts sending.
+        """
+        try:
+            # Save previous state to restore later if not already saved
+            if not self.api_override_active:
+                self._api_prev_state = {
+                    "scheduler_enabled": bool(self.var_scheduler_enabled.get()),
+                    "ps": self.entry_ps.get(),
+                    "rt": self.text_rt.get("1.0", tk.END).rstrip("\n"),
+                    "worker_running": (self.worker is not None and self.worker.is_alive())
+                }
+            # Stop current worker
+            try:
+                self.stop_sending()
+            except Exception:
+                pass
+
+            # Apply override in UI controls (do not overwrite api_password)
+            self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, ps[:16])
+            self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", rt[:64])
+            self.var_scheduler_enabled.set(False)
+            self._on_scheduler_toggled()
+
+            # Persist override config (so get_config_func used by API sees it)
+            self.cfg["ps"] = ps[:16]
+            self.cfg["rt"] = rt[:64]
+            self.cfg["scheduler_enabled"] = False
+            self.save_config()
+
+            # Start sending the override
+            self.start_sending()
+            self.api_override_active = True
+            self.status_var.set("API override active: emitting provided PS/RT")
+        except Exception as e:
+            self.status_var.set(f"API override apply failed: {e}")
+
+    def _clear_api_override(self):
+        """
+        Restore configuration saved before override, then (re)start sending according to restored settings.
+        """
+        try:
+            if not self.api_override_active or not self._api_prev_state:
+                self.status_var.set("No API override active to clear")
+                return
+            prev = self._api_prev_state
+            # Stop current override worker
+            try:
+                self.stop_sending()
+            except Exception:
+                pass
+
+            # Restore UI fields
+            self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, prev.get("ps", "GD-2015")[:16])
+            self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", prev.get("rt", "")[:64])
+            self.var_scheduler_enabled.set(bool(prev.get("scheduler_enabled", False)))
+            self._on_scheduler_toggled()
+
+            # Persist restored config
+            self.cfg["ps"] = self.entry_ps.get()
+            self.cfg["rt"] = self.text_rt.get("1.0", tk.END).rstrip("\n")
+            self.cfg["scheduler_enabled"] = bool(self.var_scheduler_enabled.get())
+            self.save_config()
+
+            # Restart sending if previously running
+            if prev.get("worker_running", False):
+                # small delay to ensure serial port is ready
+                self.root.after(200, self.start_sending)
+            self.api_override_active = False
+            self._api_prev_state = None
+            self.status_var.set("API override cleared; restored previous RDS mode")
+        except Exception as e:
+            self.status_var.set(f"API override clear failed: {e}")
+
+    def _api_stop_override(self):
+        """
+        Stop emission due to API request, preserve previous state (do not clear it).
+        """
+        try:
+            # Stop current worker but keep saved state to restore later
+            if not self.api_override_active and (self.worker and self.worker.is_alive()):
+                # Save current state if not already saved
+                self._api_prev_state = {
+                    "scheduler_enabled": bool(self.var_scheduler_enabled.get()),
+                    "ps": self.entry_ps.get(),
+                    "rt": self.text_rt.get("1.0", tk.END).rstrip("\n"),
+                    "worker_running": True
+                }
+                self.api_override_active = True
+            # Stop worker
+            self.stop_sending()
+            self.status_var.set("API requested stop: emission halted")
+        except Exception as e:
+            self.status_var.set(f"API stop failed: {e}")
+
+    # ---------------- Scheduler editor / UI helpers ----------------
     def _try_auto_start(self):
         if not self.ser.is_open:
             port = self.combo_ports.get()
@@ -1640,10 +2061,8 @@ class App:
             pass
         self.root.destroy()
 
-    # ---------------- Scheduler editor (Tkinter) ----------------
     def _on_scheduler_toggled(self):
         enabled = bool(self.var_scheduler_enabled.get())
-        # disable/enable static PS/RT inputs
         state = "disabled" if enabled else "normal"
         try:
             self.entry_ps.config(state=state)
@@ -1658,7 +2077,6 @@ class App:
         frm = ttk.Frame(win, padding=6)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        # Listbox to show entries
         lb = tk.Listbox(frm)
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,6))
 
@@ -1714,14 +2132,10 @@ class App:
                 return
             idx = sel[0]
             e = self.scheduler_entries[idx]
-            # simple inplace edit using fields
-            e["days"] = e.get("days", [])
-            # prefill fields
             sel_days.set(e.get("days", ["mon"])[0] if e.get("days") else "mon")
             ent_start.delete(0, tk.END); ent_start.insert(0, e.get("start_time","00:00"))
             ent_ps.delete(0, tk.END); ent_ps.insert(0, e.get("ps","")[:8])
             ent_rt.delete(0, tk.END); ent_rt.insert(0, e.get("rt","")[:64])
-            # remove now; user will modify and press 'Add' to append new one
             del self.scheduler_entries[idx]
             render_listbox()
 
@@ -1730,17 +2144,79 @@ class App:
         btn_del = ttk.Button(right, text="Delete selected", command=del_entry); btn_del.pack(fill=tk.X, pady=4)
 
         def save_and_close():
-            # save config file and close
             self.save_config()
             win.destroy()
 
         btn_close = ttk.Button(right, text="Save & Close", command=save_and_close); btn_close.pack(side=tk.BOTTOM, fill=tk.X, pady=6)
 
-    # ---------------- End scheduler editor ----------------
+    # --------------- Restart helpers -----------------
+    def _on_restart(self):
+        if not messagebox.askyesno("Restart", "Restart the program now?"):
+            return
+        try:
+            self.command_queue.put(("restart", None))
+            self.status_var.set("Restart requested (queued)...")
+        except Exception as e:
+            messagebox.showerror("Restart error", f"Could not request restart: {e}")
+
+    def _do_restart(self):
+        try:
+            self.status_var.set("Saving configuration before restart...")
+            self.save_config()
+        except Exception:
+            pass
+
+        try:
+            self.status_var.set("Stopping worker before restart...")
+            self.stop_sending()
+        except Exception:
+            pass
+
+        shutdown_url = f"http://127.0.0.1:{self.http_port}/_shutdown"
+        try:
+            self.status_var.set("Requesting web server shutdown...")
+            urllib.request.urlopen(shutdown_url, timeout=2)
+            time.sleep(0.25)
+        except Exception:
+            pass
+
+        try:
+            acquired = self.serial_write_lock.acquire(timeout=2)
+            try:
+                if self.ser.is_open:
+                    self.ser.close()
+            finally:
+                if acquired:
+                    self.serial_write_lock.release()
+        except Exception:
+            pass
+
+        self.status_var.set("Spawning new instance and exiting (full restart)...")
+        time.sleep(0.12)
+
+        try:
+            python = sys.executable
+            args = [python] + sys.argv
+
+            popen_kwargs = {"close_fds": True}
+
+            if os.name == "posix":
+                popen_kwargs["preexec_fn"] = os.setsid
+            else:
+                try:
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                except Exception:
+                    pass
+
+            subprocess.Popen(args, **popen_kwargs)
+            os._exit(0)
+        except Exception as e:
+            messagebox.showerror("Restart failed", f"Full restart failed: {e}")
+            self.status_var.set("Restart failed")
 
 # ----------------- main -----------------
 def main():
-    parser = argparse.ArgumentParser(description="RDS control (tkinter + Flask) with CT, TP and TA and Scheduler")
+    parser = argparse.ArgumentParser(description="RDS control (tkinter + Flask) with CT, TP and TA and Scheduler and API")
     parser.add_argument("start", nargs="?", help="use 'start' to autostart sending", default=None)
     parser.add_argument("--port", type=int, help="HTTP server port (default from config or 8080)", default=None)
     args = parser.parse_args()
@@ -1770,7 +2246,9 @@ def main():
             "ct_tp": False,
             "ct_ta": False,
             "scheduler_enabled": False,
-            "scheduler_entries": []
+            "scheduler_entries": [],
+            "alt_freqs": [],
+            "api_password": ""
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -1781,6 +2259,7 @@ def main():
                 pass
         return cfg
 
+    # create web UI flask app
     app_flask = create_flask_app(command_queue, status_queue, get_cfg_snapshot)
     flask_port = args.port or get_cfg_snapshot().get("server_port", DEFAULT_HTTP_PORT)
 
@@ -1793,6 +2272,19 @@ def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
+    # create API app
+    app_api = create_api_app(command_queue, status_queue, get_cfg_snapshot)
+
+    def run_api():
+        try:
+            app_api.run(host="0.0.0.0", port=int(API_PORT), debug=False, use_reloader=False)
+        except Exception as e:
+            status_queue.put(("status", f"API server failed to start on port {API_PORT}: {e}"))
+
+    api_thread = threading.Thread(target=run_api, daemon=True)
+    api_thread.start()
+
+    # Launch Tkinter UI
     root = tk.Tk()
     app = App(root, command_queue, status_queue, autostart=autostart, http_port=flask_port)
     root.mainloop()
