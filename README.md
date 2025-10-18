@@ -152,7 +152,7 @@ python pyrds_web_ct_pc_toggle.py --port 9090
 * It exposes a small form with the same configuration fields as the Tkinter GUI. Submitting the form sends a message to the main app via an internal command queue and the GUI is updated.
 * Quick actions available: `Save Config`, `Start`, `Stop`, and `Status (JSON)`.
 
-**Security note:** The Flask server is not hardened or authenticated — it is a convenience interface for local networks and lab use only. If you expose this port on an untrusted network, add authentication / a reverse proxy or firewall rules.
+**Security note:** The Flask server is not hardened or authenticated. It is intended as a convenience interface for local or private networks only. If you expose this port on an untrusted network, add authentication, a reverse proxy, or firewall rules.
 
 ---
 
