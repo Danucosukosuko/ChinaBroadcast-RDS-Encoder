@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GD-2015 RDS Encoder (Tkinter + Flask) - Full script with inter-frame 2s pause.
-This script inserts a 2-second, interruptible pause after each full RDS frame
-(PS + RT) is transmitted, without stopping the worker thread. The pause is
-performed using the worker's stop_event so the pause will abort immediately if
-the worker must stop (for example, when the user presses Stop).
+GD-2015 RDS Encoder (Tkinter + Flask) - Full script with DTR/RTS disabled on open.
+This is the full program with the requested changes:
+ - Serial DTR and RTS are explicitly set to False after creation and each time the serial port is opened
+ - Enforce a 1.0 second pause between every packet written to the serial port (interruptible)
 Requirements:
  - Python 3.8+
  - flask
@@ -379,6 +378,10 @@ class RDSWorker(threading.Thread):
         self._consecutive_write_failures = 0
         self._max_write_failures = 5
 
+        # New: enforce inter-packet interval (seconds)
+        self._send_interval = 1.0  # seconds between packets
+        self._last_send_ts = 0.0  # monotonic timestamp of last successful packet send
+
     def run(self):
         try:
             self._send_loop()
@@ -424,6 +427,8 @@ class RDSWorker(threading.Thread):
     def _safe_write(self, buffer: bytes):
         """
         Robust serial write: retries, flush, and attempt reopen on SerialException.
+        Enforces a minimum inter-packet delay of self._send_interval seconds between writes.
+        Waits are interruptible via self.stop_event.
         Stops the worker (by raising RuntimeError) if repeated failures occur.
         """
         if self.stop_event.is_set():
@@ -436,6 +441,19 @@ class RDSWorker(threading.Thread):
         for attempt in range(1, max_attempts + 1):
             if self.stop_event.is_set():
                 raise RuntimeError("Stop requested before write (during retries)")
+
+            # Enforce inter-packet delay BEFORE each actual write attempt
+            now = time.monotonic()
+            elapsed = now - self._last_send_ts if self._last_send_ts > 0 else None
+            if elapsed is None or elapsed >= self._send_interval:
+                # no wait needed
+                pass
+            else:
+                wait_time = self._send_interval - elapsed
+                # Use interruptible wait
+                if self.stop_event.wait(timeout=wait_time):
+                    raise RuntimeError("Stop requested during inter-packet wait")
+
             try:
                 with self.write_lock:
                     self.ser.write(buffer)
@@ -444,6 +462,8 @@ class RDSWorker(threading.Thread):
                             self.ser.flush()
                     except Exception:
                         pass
+                # Update timestamp only after successful write
+                self._last_send_ts = time.monotonic()
                 self._consecutive_write_failures = 0
                 return
             except serial.SerialTimeoutException as e:
@@ -464,7 +484,14 @@ class RDSWorker(threading.Thread):
                                 except Exception:
                                     pass
                                 time.sleep(0.05)
+                            # Attempt reopen
                             self.ser.open()
+                            # Ensure DTR/RTS are disabled after open
+                            try:
+                                self.ser.dtr = False
+                                self.ser.rts = False
+                            except Exception:
+                                pass
                             try:
                                 if hasattr(self.ser, "reset_output_buffer"):
                                     self.ser.reset_output_buffer()
@@ -661,10 +688,7 @@ class RDSWorker(threading.Thread):
                     continue
                 self.q_status.put(("debug", f"PS {i+1}/4 -> {hex_dump(buffer)}"))
                 self.q_status.put(("status", f"PS packet {i+1}/4 sent."))
-                for _ in range(10):
-                    if self.stop_event.is_set():
-                        break
-                    time.sleep(0.1)
+                # Now that _safe_write enforces a 1s pause, we don't need an extra sleep here
             return True
 
         def send_rt_loop(RT_bytes_to_use, RTAadd2_b_local):
@@ -695,10 +719,6 @@ class RDSWorker(threading.Thread):
                 self.q_status.put(("debug", f"RT {addr_index+1}/16 -> {hex_dump(buffer)}"))
                 self.q_status.put(("status", f"RT packet {addr_index+1}/16 sent."))
                 rt_index_local += 2
-                for _ in range(10):
-                    if self.stop_event.is_set():
-                        break
-                    time.sleep(0.1)
             return True
 
         last_minute_sent = None
@@ -710,10 +730,6 @@ class RDSWorker(threading.Thread):
                     self._safe_write(ct_frame)
                     self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
                     last_minute_sent = dt_for_payload.minute
-                    for _ in range(5):
-                        if self.stop_event.is_set():
-                            return
-                        time.sleep(0.1)
                 except Exception as e:
                     self.q_status.put(("debug", f"CT initial failed: {e}"))
             except Exception as e:
@@ -722,9 +738,7 @@ class RDSWorker(threading.Thread):
         if self.ct_enabled:
             self._start_ct_thread()
 
-        # Main send loop. After each complete frame (PS + RT), do an interruptible 2s pause.
-        INTER_FRAME_PAUSE_SECONDS = 2.0
-
+        # Main send loop.
         while not self.stop_event.is_set():
             if self.dynamic_scheduler_enabled:
                 active = find_active_schedule_entry(self.scheduler_entries, when=datetime.now().astimezone())
@@ -740,11 +754,6 @@ class RDSWorker(threading.Thread):
                         break
                     ok = send_rt_loop(RT_bytes, RTAadd2_b)
                     if not ok:
-                        break
-
-                    # Inter-frame pause (2s), interruptible via stop_event
-                    self.q_status.put(("debug", f"Inter-frame pause {INTER_FRAME_PAUSE_SECONDS}s (dynamic entry)"))
-                    if self.stop_event.wait(timeout=INTER_FRAME_PAUSE_SECONDS):
                         break
                 else:
                     self.q_status.put(("status", "Scheduler active but no entry for current time - skipping PS/RT"))
@@ -774,10 +783,6 @@ class RDSWorker(threading.Thread):
                                     self.q_status.put(("debug", f"AF send failed: {e}"))
                                     if self.stop_event.is_set():
                                         break
-                                for _ in range(3):
-                                    if self.stop_event.is_set():
-                                        break
-                                    time.sleep(0.1)
                     except Exception as e:
                         self.q_status.put(("debug", f"AF processing failed: {e}"))
 
@@ -791,11 +796,6 @@ class RDSWorker(threading.Thread):
                     break
                 ok = send_rt_loop(RT_bytes_static, RTAadd2_b)
                 if not ok:
-                    break
-
-                # Inter-frame pause (2s), interruptible via stop_event
-                self.q_status.put(("debug", f"Inter-frame pause {INTER_FRAME_PAUSE_SECONDS}s (static mode)"))
-                if self.stop_event.wait(timeout=INTER_FRAME_PAUSE_SECONDS):
                     break
 
         self.q_status.put(("status", "Stop requested; finishing worker."))
@@ -1433,6 +1433,13 @@ class App:
         self.ser.timeout = 1
         self.ser.write_timeout = 1
 
+        # Ensure DTR/RTS disabled by default (even when port is closed)
+        try:
+            self.ser.dtr = False
+            self.ser.rts = False
+        except Exception:
+            pass
+
         self.serial_write_lock = threading.Lock()
 
         self.stop_event = threading.Event()
@@ -1707,6 +1714,12 @@ class App:
         try:
             self.ser.port = port
             self.ser.open()
+            # Ensure DTR/RTS are disabled after opening
+            try:
+                self.ser.dtr = False
+                self.ser.rts = False
+            except Exception:
+                pass
             try:
                 if hasattr(self.ser, "reset_input_buffer"):
                     self.ser.reset_input_buffer()
@@ -1744,6 +1757,12 @@ class App:
                 try:
                     self.ser.port = port
                     self.ser.open()
+                    # Ensure DTR/RTS are disabled after opening
+                    try:
+                        self.ser.dtr = False
+                        self.ser.rts = False
+                    except Exception:
+                        pass
                     try:
                         if hasattr(self.ser, "reset_input_buffer"):
                             self.ser.reset_input_buffer()
@@ -1983,6 +2002,12 @@ class App:
                             time.sleep(0.15)
                             self.ser.port = port
                             self.ser.open()
+                            # Ensure DTR/RTS disabled after automatic reopen
+                            try:
+                                self.ser.dtr = False
+                                self.ser.rts = False
+                            except Exception:
+                                pass
                             try:
                                 if hasattr(self.ser, "reset_input_buffer"):
                                     self.ser.reset_input_buffer()
@@ -2095,7 +2120,7 @@ class App:
         except Exception as e:
             self.status_var.set(f"Apply remote config failed: {e}")
 
-    # API override helpers (unchanged, omitted here for brevity)
+    # API override helpers (unchanged)
     def _apply_api_override(self, ps: str, rt: str):
         try:
             if not getattr(self, "api_override_active", False):
@@ -2181,6 +2206,12 @@ class App:
                 try:
                     self.ser.port = port
                     self.ser.open()
+                    # Ensure DTR/RTS are disabled after auto-open
+                    try:
+                        self.ser.dtr = False
+                        self.ser.rts = False
+                    except Exception:
+                        pass
                     try:
                         if hasattr(self.ser, "reset_input_buffer"):
                             self.ser.reset_input_buffer()
