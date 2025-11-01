@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+"""
+GD-2015 RDS Encoder (Tkinter + Flask) - Full script with inter-frame 2s pause.
+This script inserts a 2-second, interruptible pause after each full RDS frame
+(PS + RT) is transmitted, without stopping the worker thread. The pause is
+performed using the worker's stop_event so the pause will abort immediately if
+the worker must stop (for example, when the user presses Stop).
+Requirements:
+ - Python 3.8+
+ - flask
+ - pyserial
+"""
 from __future__ import annotations
 
 import sys
@@ -100,8 +110,10 @@ def to_hex_byte(hexstr: str) -> int:
     if hexstr is None:
         raise ValueError("hex string is None")
     s = str(hexstr).strip()
-    if len(s) < 2:
+    if len(s) < 1:
         raise ValueError(f"hex string too short: '{hexstr}'")
+    if len(s) == 1:
+        s = "0" + s
     try:
         return int(s, 16) & 0xFF
     except ValueError as e:
@@ -189,8 +201,10 @@ def make_rds_group0a_frame(pi_hex: str, tp: int = 0, pty: int = 0, ta: int = 0, 
     GROUP_TYPE = 0
     VERSION_A = 0
     top2 = 0
-    block3 = (ps_bytes_pair[0][0] << 8) | (ps_bytes_pair[0][1] & 0xFF)
-    block4 = (ps_bytes_pair[1][0] << 8) | (ps_bytes_pair[1][1] & 0xFF)
+    a = ps_bytes_pair[0] if isinstance(ps_bytes_pair[0], (bytes, bytearray)) else pad_or_truncate(ps_bytes_pair[0], 2).encode("latin-1", errors="replace")
+    b = ps_bytes_pair[1] if isinstance(ps_bytes_pair[1], (bytes, bytearray)) else pad_or_truncate(ps_bytes_pair[1], 2).encode("latin-1", errors="replace")
+    block3 = (a[0] << 8) | (a[1] & 0xFF)
+    block4 = (b[0] << 8) | (b[1] & 0xFF)
 
     block2_base = (GROUP_TYPE << 12) | (VERSION_A << 11) | ((tp & 0x1) << 10) | ((pty & 0x1F) << 5) | ((ta & 0x1) << 4)
     block2 = block2_base | (top2 & 0x3)
@@ -213,7 +227,9 @@ def make_rds_group0a_af_frame(pi_hex: str, af_byte_a: int, af_byte_b: int, tp: i
     VERSION_A = 0
     top2 = 0
     block3 = ((af_byte_a & 0xFF) << 8) | (af_byte_b & 0xFF)
-    block4 = (ps_bytes_pair[1][0] << 8) | (ps_bytes_pair[1][1] & 0xFF)
+    a = ps_bytes_pair[0] if isinstance(ps_bytes_pair[0], (bytes, bytearray)) else pad_or_truncate(ps_bytes_pair[0], 2).encode("latin-1", errors="replace")
+    b = ps_bytes_pair[1] if isinstance(ps_bytes_pair[1], (bytes, bytearray)) else pad_or_truncate(ps_bytes_pair[1], 2).encode("latin-1", errors="replace")
+    block4 = (b[0] << 8) | (b[1] & 0xFF)
 
     block2_base = (GROUP_TYPE << 12) | (VERSION_A << 11) | ((tp & 0x1) << 10) | ((pty & 0x1F) << 5) | ((ta & 0x1) << 4)
     block2 = block2_base | (top2 & 0x3)
@@ -264,10 +280,8 @@ class RDSParams:
 def parse_schedule_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
     days_src = raw.get("days", [])
     days_norm = []
-
     if isinstance(days_src, str):
         days_src = [days_src]
-
     for d in days_src:
         dd = str(d).strip().lower()
         if dd in ("mon", "monday"):
@@ -318,7 +332,6 @@ def find_active_schedule_entry(entries: List[Dict[str, Any]], when: Optional[dat
         when = datetime.now().astimezone()
     today_idx = (when.weekday())
     now_min = when.hour * 60 + when.minute
-
     candidates = []
     for e in entries:
         if not e.get("enabled", True):
@@ -326,7 +339,6 @@ def find_active_schedule_entry(entries: List[Dict[str, Any]], when: Optional[dat
         if today_idx in e.get("days", []):
             if e.get("start_min", 0) <= now_min:
                 candidates.append(e)
-
     if not candidates:
         return None
     candidates.sort(key=lambda x: x.get("start_min", 0), reverse=True)
@@ -362,9 +374,10 @@ class RDSWorker(threading.Thread):
         self.dynamic_scheduler_enabled = bool(dynamic_scheduler_enabled)
         self.scheduler_entries = [parse_schedule_entry(e) for e in (scheduler_entries or [])]
 
-        # alt_freqs: list of dicts {'freq': '98.3', 'label': '...'}. Cap to 25 for Method A.
         self.alt_freqs = (alt_freqs or [])[:25]
         self._ct_thread = None
+        self._consecutive_write_failures = 0
+        self._max_write_failures = 5
 
     def run(self):
         try:
@@ -409,22 +422,79 @@ class RDSWorker(threading.Thread):
         }
 
     def _safe_write(self, buffer: bytes):
+        """
+        Robust serial write: retries, flush, and attempt reopen on SerialException.
+        Stops the worker (by raising RuntimeError) if repeated failures occur.
+        """
         if self.stop_event.is_set():
             raise RuntimeError("Stop requested before write")
-        if not self.ser.is_open:
+        if not getattr(self.ser, "is_open", False):
             raise RuntimeError("Serial port closed")
-        try:
-            with self.write_lock:
-                self.ser.write(buffer)
-        except serial.SerialTimeoutException as e:
-            self.q_status.put(("error", f"Serial write timeout: {e}"))
-            raise
-        except serial.SerialException as e:
-            self.q_status.put(("error", f"Serial error during write: {e}"))
-            raise
-        except Exception as e:
-            self.q_status.put(("error", f"Unknown error during write: {e}"))
-            raise
+
+        max_attempts = 3
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            if self.stop_event.is_set():
+                raise RuntimeError("Stop requested before write (during retries)")
+            try:
+                with self.write_lock:
+                    self.ser.write(buffer)
+                    try:
+                        if hasattr(self.ser, "flush"):
+                            self.ser.flush()
+                    except Exception:
+                        pass
+                self._consecutive_write_failures = 0
+                return
+            except serial.SerialTimeoutException as e:
+                last_exc = e
+                self.q_status.put(("debug", f"SerialTimeout on write (attempt {attempt}): {e}"))
+                if self.stop_event.wait(0.2):
+                    break
+                continue
+            except serial.SerialException as e:
+                last_exc = e
+                self.q_status.put(("debug", f"SerialException on write (attempt {attempt}): {e}"))
+                try:
+                    with self.write_lock:
+                        try:
+                            if getattr(self.ser, "is_open", False):
+                                try:
+                                    self.ser.close()
+                                except Exception:
+                                    pass
+                                time.sleep(0.05)
+                            self.ser.open()
+                            try:
+                                if hasattr(self.ser, "reset_output_buffer"):
+                                    self.ser.reset_output_buffer()
+                                if hasattr(self.ser, "reset_input_buffer"):
+                                    self.ser.reset_input_buffer()
+                            except Exception:
+                                pass
+                            self.q_status.put(("status", "Serial port reopened after exception (auto-recover)."))
+                        except Exception as open_e:
+                            self.q_status.put(("debug", f"Reopen attempt failed: {open_e}"))
+                except Exception:
+                    pass
+                if self.stop_event.wait(0.3):
+                    break
+                continue
+            except Exception as e:
+                last_exc = e
+                self.q_status.put(("debug", f"Unknown error on serial write (attempt {attempt}): {e}"))
+                if self.stop_event.wait(0.2):
+                    break
+                continue
+
+        self._consecutive_write_failures += 1
+        self.q_status.put(("debug", f"Consecutive write failures: {self._consecutive_write_failures}"))
+        if self._consecutive_write_failures >= self._max_write_failures:
+            msg = f"Serial writes failed repeatedly; aborting worker. Last error: {last_exc}"
+            self.q_status.put(("error", msg))
+            self.stop_event.set()
+            raise RuntimeError(msg)
+        raise last_exc
 
     def _get_ct_datetime_and_offset(self):
         if self.ct_omit_offset:
@@ -477,11 +547,16 @@ class RDSWorker(threading.Thread):
                 if last_minute_sent is None or dt_for_payload.minute != last_minute_sent:
                     ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload,
                                                              offset_to_send, pty=0, tp=int(bool(self.ct_tp)))
-                    self._safe_write(ct_frame)
-                    self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
-                    last_minute_sent = dt_for_payload.minute
+                    try:
+                        self._safe_write(ct_frame)
+                        self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
+                        last_minute_sent = dt_for_payload.minute
+                    except Exception as e:
+                        self.q_status.put(("debug", f"CT thread failed to send: {e}"))
+                        if self.stop_event.is_set():
+                            break
             except Exception as e:
-                self.q_status.put(("debug", f"CT thread failed to send: {e}"))
+                self.q_status.put(("debug", f"CT thread exception: {e}"))
 
         self.q_status.put(("debug", "CT thread exiting."))
 
@@ -531,7 +606,7 @@ class RDSWorker(threading.Thread):
     def _send_loop(self):
         static_slices = self._prepare_slices_static()
 
-        if not self.ser.is_open:
+        if not getattr(self.ser, "is_open", False):
             raise RuntimeError("Serial port not open")
 
         PS_bytes_static = [encode_gb2312_two_bytes(p) for p in static_slices["PSparts"]]
@@ -575,7 +650,15 @@ class RDSWorker(threading.Thread):
                 buffer[6] = PS_bytes_to_use[i][0]
                 buffer[7] = PS_bytes_to_use[i][1]
                 buffer[8] = EOL
-                self._safe_write(bytes(buffer))
+                try:
+                    self._safe_write(bytes(buffer))
+                except Exception as e:
+                    self.q_status.put(("debug", f"PS send failed: {e}"))
+                    if self.stop_event.is_set():
+                        return False
+                    if self.stop_event.wait(0.5):
+                        return False
+                    continue
                 self.q_status.put(("debug", f"PS {i+1}/4 -> {hex_dump(buffer)}"))
                 self.q_status.put(("status", f"PS packet {i+1}/4 sent."))
                 for _ in range(10):
@@ -601,7 +684,14 @@ class RDSWorker(threading.Thread):
                 buffer[6] = r1[0]
                 buffer[7] = r1[1]
                 buffer[8] = EOL
-                self._safe_write(bytes(buffer))
+                try:
+                    self._safe_write(bytes(buffer))
+                except Exception as e:
+                    self.q_status.put(("debug", f"RT send failed: {e}"))
+                    if self.stop_event.is_set():
+                        return False
+                    if self.stop_event.wait(0.5):
+                        return False
                 self.q_status.put(("debug", f"RT {addr_index+1}/16 -> {hex_dump(buffer)}"))
                 self.q_status.put(("status", f"RT packet {addr_index+1}/16 sent."))
                 rt_index_local += 2
@@ -616,18 +706,24 @@ class RDSWorker(threading.Thread):
             try:
                 dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
                 ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload, offset_to_send, pty=0, tp=int(bool(self.ct_tp)))
-                self._safe_write(ct_frame)
-                self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
-                last_minute_sent = dt_for_payload.minute
-                for _ in range(5):
-                    if self.stop_event.is_set():
-                        return
-                    time.sleep(0.1)
+                try:
+                    self._safe_write(ct_frame)
+                    self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
+                    last_minute_sent = dt_for_payload.minute
+                    for _ in range(5):
+                        if self.stop_event.is_set():
+                            return
+                        time.sleep(0.1)
+                except Exception as e:
+                    self.q_status.put(("debug", f"CT initial failed: {e}"))
             except Exception as e:
-                self.q_status.put(("debug", f"CT initial failed: {e}"))
+                self.q_status.put(("debug", f"CT initial build error: {e}"))
 
         if self.ct_enabled:
             self._start_ct_thread()
+
+        # Main send loop. After each complete frame (PS + RT), do an interruptible 2s pause.
+        INTER_FRAME_PAUSE_SECONDS = 2.0
 
         while not self.stop_event.is_set():
             if self.dynamic_scheduler_enabled:
@@ -645,6 +741,11 @@ class RDSWorker(threading.Thread):
                     ok = send_rt_loop(RT_bytes, RTAadd2_b)
                     if not ok:
                         break
+
+                    # Inter-frame pause (2s), interruptible via stop_event
+                    self.q_status.put(("debug", f"Inter-frame pause {INTER_FRAME_PAUSE_SECONDS}s (dynamic entry)"))
+                    if self.stop_event.wait(timeout=INTER_FRAME_PAUSE_SECONDS):
+                        break
                 else:
                     self.q_status.put(("status", "Scheduler active but no entry for current time - skipping PS/RT"))
                     for _ in range(30):
@@ -653,6 +754,7 @@ class RDSWorker(threading.Thread):
                         time.sleep(1.0)
                     continue
             else:
+                # Static mode
                 if self.alt_freqs:
                     try:
                         af_pairs = self._build_af_pairs_from_altfreqs(self.alt_freqs, PS_bytes_static)
@@ -670,6 +772,8 @@ class RDSWorker(threading.Thread):
                                     self.q_status.put(("status", f"AF packet {idx+1}/{len(af_pairs)} sent."))
                                 except Exception as e:
                                     self.q_status.put(("debug", f"AF send failed: {e}"))
+                                    if self.stop_event.is_set():
+                                        break
                                 for _ in range(3):
                                     if self.stop_event.is_set():
                                         break
@@ -687,6 +791,11 @@ class RDSWorker(threading.Thread):
                     break
                 ok = send_rt_loop(RT_bytes_static, RTAadd2_b)
                 if not ok:
+                    break
+
+                # Inter-frame pause (2s), interruptible via stop_event
+                self.q_status.put(("debug", f"Inter-frame pause {INTER_FRAME_PAUSE_SECONDS}s (static mode)"))
+                if self.stop_event.wait(timeout=INTER_FRAME_PAUSE_SECONDS):
                     break
 
         self.q_status.put(("status", "Stop requested; finishing worker."))
@@ -773,7 +882,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         <div class="row mt-2">
           <div class="col-md-4">
             <label class="form-label">PTY index</label>
-            <input name="pty_index" class="form-control" value="{{cfg.pty_index}}">
+            <input name="pty_index" class="form-control" value="{{cfg.pty_index}}"> 
           </div>
           <div class="col-md-4">
             <label class="form-label">PI (4 hex)</label>
@@ -1152,10 +1261,23 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         except Exception:
             alt_freqs = []
 
+        try:
+            baud = int(form.get("baud", 9600))
+        except Exception:
+            baud = 9600
+        try:
+            pty_index = int(form.get("pty_index", 1))
+        except Exception:
+            pty_index = 1
+        try:
+            server_port = int(form.get("server_port", DEFAULT_HTTP_PORT))
+        except Exception:
+            server_port = DEFAULT_HTTP_PORT
+
         cfg = {
             "port": form.get("port", ""),
-            "baud": int(form.get("baud", 9600)),
-            "pty_index": int(form.get("pty_index", 1)),
+            "baud": baud,
+            "pty_index": pty_index,
             "pi": form.get("pi", "C121"),
             "ps": form.get("ps", "GD-2015"),
             "rt": form.get("rt", ""),
@@ -1163,7 +1285,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             "debug": bool(form.get("debug")),
             "save_log": bool(form.get("save_log")),
             "log_filename": form.get("log_filename", "rds_debug.log") if form.get("log_filename") else "rds_debug.log",
-            "server_port": int(form.get("server_port", DEFAULT_HTTP_PORT)),
+            "server_port": server_port,
             "ct_enabled": bool(form.get("ct_enabled")),
             "ct_offset": int(form.get("ct_offset") or 60),
             "ct_use_pc_time": bool(form.get("ct_use_pc_time")),
@@ -1259,17 +1381,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
 
 # ----------------- JSON API (auth) -----------------
 def create_api_app(command_queue: queue.Queue, status_queue: queue.Queue, get_config_func):
-    """
-    Minimal JSON API on 0.0.0.0:16590
-    POST /api/control
-    Body (JSON):
-    {
-      "password": "xxx",
-      "cmd": "set"|"clear"|"stop"|"status",
-      "ps": "PSVALUE",      optional for 'set'
-      "rt": "RT text"       optional for 'set'
-    }
-    """
     app = Flask("pyrds_api")
 
     @app.route("/api/control", methods=["POST"])
@@ -1284,17 +1395,14 @@ def create_api_app(command_queue: queue.Queue, status_queue: queue.Queue, get_co
 
         cfg = get_config_func()
         configured_pwd = cfg.get("api_password", "") or ""
-        # Validate password
         if configured_pwd == "":
             return jsonify({"error": "API password not configured on server"}), 403
         if pwd != configured_pwd:
             return jsonify({"error": "invalid password"}), 403
 
-        # Auth ok -> handle commands by putting into command_queue for the Tk app to handle
         if cmd == "set":
             ps = data.get("ps", "")
             rt = data.get("rt", "")
-            # push override command
             command_queue.put(("api_set_override", {"ps": ps, "rt": rt}))
             return jsonify({"result": "override_set", "ps": ps, "rt": rt})
         elif cmd == "clear":
@@ -1304,8 +1412,6 @@ def create_api_app(command_queue: queue.Queue, status_queue: queue.Queue, get_co
             command_queue.put(("api_stop_override", None))
             return jsonify({"result": "stopped"})
         elif cmd == "status":
-            # Provide immediate status from config snapshot
-            # Also enqueue a "query" if UI wants to push live statuses via status_queue (not necessary)
             return jsonify({"result": "ok", "config": cfg})
         else:
             return jsonify({"error": "unknown cmd"}), 400
@@ -1321,6 +1427,7 @@ class App:
         self.autostart = autostart
         self.http_port = http_port
 
+        # Serial object configuration
         self.ser = serial.Serial()
         self.ser.baudrate = 9600
         self.ser.timeout = 1
@@ -1332,12 +1439,12 @@ class App:
         self.worker: Optional[RDSWorker] = None
 
         self.scheduler_entries = []
-        self.alt_freqs = []  # persisted alternative frequencies
+        self.alt_freqs = []
 
-        # For API override handling
-        self.api_override_active = False
-        self._api_prev_state: Optional[Dict[str, Any]] = None  # saved state to restore later
+        # Manual-stop flag (set when user presses Stop)
+        self._manual_stop = False
 
+        # persisted configuration snapshot
         self.cfg = {
             "port": "",
             "baud": 9600,
@@ -1373,6 +1480,9 @@ class App:
             self.root.after(700, self._try_auto_start)
 
     def _build_ui(self):
+        """
+        Build the Tkinter user interface.
+        """
         self.root.title("GD-2015 RDS Encoder")
         self.root.geometry("1030x820")
         frm = ttk.Frame(self.root, padding=8)
@@ -1441,7 +1551,8 @@ class App:
         btns.pack(fill=tk.X, padx=6, pady=6)
         self.btn_send = ttk.Button(btns, text="Send", command=self.start_sending)
         self.btn_send.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,4))
-        self.btn_stop = ttk.Button(btns, text="Stop", command=self.stop_sending, state=tk.DISABLED)
+        # Stop button must call user_stop to mark manual stop
+        self.btn_stop = ttk.Button(btns, text="Stop", command=self.user_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4,0))
         self.btn_restart = ttk.Button(btns, text="Restart", command=self._on_restart)
         self.btn_restart.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=(8,0))
@@ -1477,7 +1588,6 @@ class App:
         chk_ta = ttk.Checkbutton(gb_ct, text="TA (Traffic Announcement)", variable=self.var_ta)
         chk_ta.pack(side=tk.LEFT, padx=(12,6))
 
-        # Debug & Scheduler UI
         gb_debugctrl = ttk.LabelFrame(frm, text="Debug")
         gb_debugctrl.pack(fill=tk.X, padx=6, pady=6)
         self.var_debug = tk.BooleanVar(value=False)
@@ -1507,7 +1617,6 @@ class App:
         self.btn_edit_scheduler = ttk.Button(gb_sched, text="Edit Scheduler...", command=self._open_scheduler_editor)
         self.btn_edit_scheduler.pack(side=tk.LEFT, padx=6)
 
-        # small view for alternative frequencies in the Tk UI (persisted but editable only via web)
         gb_alt = ttk.LabelFrame(frm, text="Alternative Frequencies (stored in config)")
         gb_alt.pack(fill=tk.X, padx=6, pady=6)
         self.lbl_alt_preview = ttk.Label(gb_alt, text="(Manage using the web UI)")
@@ -1540,8 +1649,11 @@ class App:
             pass
 
     def _set_led_color(self, color: str):
-        self.led_canvas.delete("all")
-        self.led_canvas.create_oval(0, 0, 14, 14, fill=color, outline=color)
+        try:
+            self.led_canvas.delete("all")
+            self.led_canvas.create_oval(0, 0, 14, 14, fill=color, outline=color)
+        except Exception:
+            pass
 
     def _fill_pty(self):
         vals = [name for _hex, name in PTY_TABLE]
@@ -1570,13 +1682,13 @@ class App:
         self.status_var.set("Ports scanned")
 
     def toggle_port(self):
-        if self.ser.is_open:
+        if getattr(self.ser, "is_open", False):
             self.stop_sending()
             time.sleep(0.05)
             try:
                 acquired = self.serial_write_lock.acquire(timeout=2)
                 try:
-                    if self.ser.is_open:
+                    if getattr(self.ser, "is_open", False):
                         self.ser.close()
                 finally:
                     if acquired:
@@ -1595,6 +1707,13 @@ class App:
         try:
             self.ser.port = port
             self.ser.open()
+            try:
+                if hasattr(self.ser, "reset_input_buffer"):
+                    self.ser.reset_input_buffer()
+                if hasattr(self.ser, "reset_output_buffer"):
+                    self.ser.reset_output_buffer()
+            except Exception:
+                pass
             self._set_led_color("green")
             self.btn_open.config(text="Close Serial Port")
             self.status_var.set(f"Opened {port}")
@@ -1612,13 +1731,26 @@ class App:
         return RDSParams(FGdata=FGdata, GJ_input=GJ_input, PS_input=PS_input, RT_input=RT_input, RTaddress=RTaddress)
 
     def start_sending(self):
-        # start or restart worker according to current UI config
-        if not self.ser.is_open:
+        """
+        Start or restart the RDS worker according to current user interface configuration.
+        Starting via UI clears the manual-stop flag.
+        """
+        # When user starts sending, clear manual stop so any logic depending on manual stop is reset
+        self._manual_stop = False
+
+        if not getattr(self.ser, "is_open", False):
             port = self.combo_ports.get()
             if port:
                 try:
                     self.ser.port = port
                     self.ser.open()
+                    try:
+                        if hasattr(self.ser, "reset_input_buffer"):
+                            self.ser.reset_input_buffer()
+                        if hasattr(self.ser, "reset_output_buffer"):
+                            self.ser.reset_output_buffer()
+                    except Exception:
+                        pass
                     self._set_led_color("green")
                     self.btn_open.config(text="Close Serial Port")
                     self.status_var.set(f"Opened {port} automatically")
@@ -1667,7 +1799,22 @@ class App:
         self.btn_stop.config(state=tk.NORMAL)
         self.status_var.set("Sending started")
 
+    def user_stop(self):
+        """
+        Called when the user explicitly requests a stop via the UI Stop button.
+        This marks manual stop and stops the worker.
+        """
+        try:
+            self._manual_stop = True
+            self.stop_sending()
+            self.status_var.set("User stopped emission (manual stop).")
+        except Exception as e:
+            self.status_var.set(f"User stop failed: {e}")
+
     def stop_sending(self):
+        """
+        Stop the active worker. This method does not change the manual-stop flag.
+        """
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
             waited = 0.0
@@ -1786,7 +1933,6 @@ class App:
                 self.cfg["api_password"] = cfg.get("api_password", "")
             except Exception:
                 pass
-            # update preview label (simple)
             try:
                 if self.alt_freqs:
                     self.lbl_alt_preview.config(text=", ".join([f['freq'] for f in self.alt_freqs]))
@@ -1821,7 +1967,33 @@ class App:
                 elif typ == "error":
                     self.status_var.set("ERROR: " + msg)
                     messagebox.showerror("Worker error", msg)
-                    self.stop_sending()
+                    try:
+                        self.stop_sending()
+                    except Exception:
+                        pass
+                    port = self.combo_ports.get()
+                    if port:
+                        self.status_var.set("Attempting auto-reopen after error...")
+                        try:
+                            try:
+                                if getattr(self.ser, "is_open", False):
+                                    self.ser.close()
+                            except Exception:
+                                pass
+                            time.sleep(0.15)
+                            self.ser.port = port
+                            self.ser.open()
+                            try:
+                                if hasattr(self.ser, "reset_input_buffer"):
+                                    self.ser.reset_input_buffer()
+                                if hasattr(self.ser, "reset_output_buffer"):
+                                    self.ser.reset_output_buffer()
+                            except Exception:
+                                pass
+                            self.status_var.set("Serial reopened; restarting emission...")
+                            self.root.after(200, self.start_sending)
+                        except Exception as e2:
+                            self.status_var.set(f"Auto-reopen failed: {e2}")
                 elif typ == "finished":
                     self.btn_send.config(state=tk.NORMAL)
                     self.btn_stop.config(state=tk.DISABLED)
@@ -1843,7 +2015,6 @@ class App:
                     self.status_var.set("Restart requested...")
                     self.root.after(100, self._do_restart)
                 elif cmd == "api_set_override":
-                    # payload: {"ps": "...", "rt": "..."}
                     ps = (payload.get("ps") or "")[:64]
                     rt = (payload.get("rt") or "")[:1024]
                     self._apply_api_override(ps=ps, rt=rt)
@@ -1924,40 +2095,31 @@ class App:
         except Exception as e:
             self.status_var.set(f"Apply remote config failed: {e}")
 
-    # ---------------- API override helpers ----------------
+    # API override helpers (unchanged, omitted here for brevity)
     def _apply_api_override(self, ps: str, rt: str):
-        """
-        Called when API requests to set PS/RT override.
-        Saves previous state, disables scheduler, sets PS/RT to provided values and (re)starts sending.
-        """
         try:
-            # Save previous state to restore later if not already saved
-            if not self.api_override_active:
+            if not getattr(self, "api_override_active", False):
                 self._api_prev_state = {
                     "scheduler_enabled": bool(self.var_scheduler_enabled.get()),
                     "ps": self.entry_ps.get(),
                     "rt": self.text_rt.get("1.0", tk.END).rstrip("\n"),
                     "worker_running": (self.worker is not None and self.worker.is_alive())
                 }
-            # Stop current worker
             try:
                 self.stop_sending()
             except Exception:
                 pass
 
-            # Apply override in UI controls (do not overwrite api_password)
             self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, ps[:16])
             self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", rt[:64])
             self.var_scheduler_enabled.set(False)
             self._on_scheduler_toggled()
 
-            # Persist override config (so get_config_func used by API sees it)
             self.cfg["ps"] = ps[:16]
             self.cfg["rt"] = rt[:64]
             self.cfg["scheduler_enabled"] = False
             self.save_config()
 
-            # Start sending the override
             self.start_sending()
             self.api_override_active = True
             self.status_var.set("API override active: emitting provided PS/RT")
@@ -1965,35 +2127,27 @@ class App:
             self.status_var.set(f"API override apply failed: {e}")
 
     def _clear_api_override(self):
-        """
-        Restore configuration saved before override, then (re)start sending according to restored settings.
-        """
         try:
-            if not self.api_override_active or not self._api_prev_state:
+            if not getattr(self, "api_override_active", False) or not self._api_prev_state:
                 self.status_var.set("No API override active to clear")
                 return
             prev = self._api_prev_state
-            # Stop current override worker
             try:
                 self.stop_sending()
             except Exception:
                 pass
 
-            # Restore UI fields
             self.entry_ps.delete(0, tk.END); self.entry_ps.insert(0, prev.get("ps", "GD-2015")[:16])
             self.text_rt.delete("1.0", tk.END); self.text_rt.insert("1.0", prev.get("rt", "")[:64])
             self.var_scheduler_enabled.set(bool(prev.get("scheduler_enabled", False)))
             self._on_scheduler_toggled()
 
-            # Persist restored config
             self.cfg["ps"] = self.entry_ps.get()
             self.cfg["rt"] = self.text_rt.get("1.0", tk.END).rstrip("\n")
             self.cfg["scheduler_enabled"] = bool(self.var_scheduler_enabled.get())
             self.save_config()
 
-            # Restart sending if previously running
             if prev.get("worker_running", False):
-                # small delay to ensure serial port is ready
                 self.root.after(200, self.start_sending)
             self.api_override_active = False
             self._api_prev_state = None
@@ -2002,13 +2156,8 @@ class App:
             self.status_var.set(f"API override clear failed: {e}")
 
     def _api_stop_override(self):
-        """
-        Stop emission due to API request, preserve previous state (do not clear it).
-        """
         try:
-            # Stop current worker but keep saved state to restore later
-            if not self.api_override_active and (self.worker and self.worker.is_alive()):
-                # Save current state if not already saved
+            if not getattr(self, "api_override_active", False) and (self.worker and self.worker.is_alive()):
                 self._api_prev_state = {
                     "scheduler_enabled": bool(self.var_scheduler_enabled.get()),
                     "ps": self.entry_ps.get(),
@@ -2016,15 +2165,13 @@ class App:
                     "worker_running": True
                 }
                 self.api_override_active = True
-            # Stop worker
             self.stop_sending()
             self.status_var.set("API requested stop: emission halted")
         except Exception as e:
             self.status_var.set(f"API stop failed: {e}")
 
-    # ---------------- Scheduler editor / UI helpers ----------------
     def _try_auto_start(self):
-        if not self.ser.is_open:
+        if not getattr(self.ser, "is_open", False):
             port = self.combo_ports.get()
             if not port:
                 vals = list(self.combo_ports['values'])
@@ -2034,11 +2181,18 @@ class App:
                 try:
                     self.ser.port = port
                     self.ser.open()
+                    try:
+                        if hasattr(self.ser, "reset_input_buffer"):
+                            self.ser.reset_input_buffer()
+                        if hasattr(self.ser, "reset_output_buffer"):
+                            self.ser.reset_output_buffer()
+                    except Exception:
+                        pass
                     self._set_led_color("green")
                     self.btn_open.config(text="Close Serial Port")
                 except Exception as e:
                     self.status_var.set(f"Auto-open port failed: {e}")
-        if self.ser.is_open:
+        if getattr(self.ser, "is_open", False):
             self.root.after(200, self.start_sending)
         else:
             self.status_var.set("Auto-start: no port opened")
@@ -2052,7 +2206,7 @@ class App:
         try:
             acquired = self.serial_write_lock.acquire(timeout=2)
             try:
-                if self.ser.is_open:
+                if getattr(self.ser, "is_open", False):
                     self.ser.close()
             finally:
                 if acquired:
@@ -2149,7 +2303,6 @@ class App:
 
         btn_close = ttk.Button(right, text="Save & Close", command=save_and_close); btn_close.pack(side=tk.BOTTOM, fill=tk.X, pady=6)
 
-    # --------------- Restart helpers -----------------
     def _on_restart(self):
         if not messagebox.askyesno("Restart", "Restart the program now?"):
             return
@@ -2183,7 +2336,7 @@ class App:
         try:
             acquired = self.serial_write_lock.acquire(timeout=2)
             try:
-                if self.ser.is_open:
+                if getattr(self.ser, "is_open", False):
                     self.ser.close()
             finally:
                 if acquired:
