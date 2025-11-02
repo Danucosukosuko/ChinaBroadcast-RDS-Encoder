@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GD-2015 RDS Encoder (Tkinter + Flask) - Full script with DTR/RTS disabled on open.
-This is the full program with the requested changes:
- - Serial DTR and RTS are explicitly set to False after creation and each time the serial port is opened
- - Enforce a 1.0 second pause between every packet written to the serial port (interruptible)
-Requirements:
- - Python 3.8+
- - flask
- - pyserial
+GD-2015 RDS Encoder
+ver: 1.4
 """
 from __future__ import annotations
-
 import sys
 import os
 import json
@@ -19,9 +12,11 @@ import threading
 import time
 import queue
 import argparse
+import subprocess
+import urllib.request
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
-
 from datetime import datetime, timezone
 import webbrowser
 import serial
@@ -29,9 +24,6 @@ import serial.tools.list_ports
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-import urllib.request
-import subprocess
-import logging
 
 # ---------- Logging ----------
 logger = logging.getLogger("pyrds")
@@ -44,7 +36,7 @@ logger.setLevel(logging.INFO)
 # ---------- Constants ----------
 CONFIG_FILE = "config.json"
 DEFAULT_HTTP_PORT = 8080
-API_PORT = 16590  # API port requested by user
+API_PORT = 16590
 
 PTY_TABLE = [
     ("0008", "None"),
@@ -347,7 +339,7 @@ def ps8_to_ps16(ps8: str) -> str:
     ps8 = ps8[:8].ljust(8)
     return ps8 + ps8
 
-# ----------------- RDS Worker -----------------
+# ----------------- RDS Worker with writer-thread (ensures 1s between ANY packets) -----------------
 class RDSWorker(threading.Thread):
     def __init__(self, ser: serial.Serial, write_lock: threading.Lock, params: RDSParams,
                  stop_event: threading.Event, q_status: queue.Queue,
@@ -375,20 +367,169 @@ class RDSWorker(threading.Thread):
 
         self.alt_freqs = (alt_freqs or [])[:25]
         self._ct_thread = None
-        self._consecutive_write_failures = 0
-        self._max_write_failures = 5
 
-        # New: enforce inter-packet interval (seconds)
-        self._send_interval = 1.0  # seconds between packets
-        self._last_send_ts = 0.0  # monotonic timestamp of last successful packet send
+        # Writer queue: each item is (frame_bytes, threading.Event)
+        self._writer_queue: queue.Queue[Tuple[Optional[bytes], Optional[threading.Event]]] = queue.Queue()
+        self._writer_thread: Optional[threading.Thread] = None
 
     def run(self):
         try:
+            self._start_writer_thread()
             self._send_loop()
         except Exception as e:
             self.q_status.put(("error", str(e)))
         finally:
+            # signal writer thread to exit
+            try:
+                self._writer_queue.put((None, None))
+                if self._writer_thread is not None:
+                    self._writer_thread.join(timeout=1.0)
+            except Exception:
+                pass
             self.q_status.put(("finished", ""))
+
+    def _start_writer_thread(self):
+        if self._writer_thread and self._writer_thread.is_alive():
+            return
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+        self.q_status.put(("debug", "Writer thread started."))
+
+    def _writer_loop(self):
+        """
+        Serializes all writes. After writing a frame (and flush), sets the event
+        to notify the enqueuer, then waits EXACTLY 1 second (interruptible).
+        """
+        while True:
+            try:
+                item = self._writer_queue.get(timeout=0.2)
+            except queue.Empty:
+                if self.stop_event.is_set():
+                    break
+                continue
+            if item is None:
+                continue
+            frame, ev = item
+            if frame is None:
+                break
+            try:
+                with self.write_lock:
+                    if not getattr(self.ser, "is_open", False):
+                        try:
+                            self.ser.open()
+                            try:
+                                self.ser.dtr = False
+                                self.ser.rts = False
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            self.q_status.put(("debug", f"Writer: failed to open serial: {e}"))
+                    try:
+                        self.ser.write(frame)
+                        try:
+                            self.ser.flush()
+                        except Exception:
+                            pass
+                        # wait small time for out_waiting to drain (best-effort)
+                        try:
+                            t0 = time.time()
+                            while hasattr(self.ser, "out_waiting") and getattr(self.ser, "out_waiting") and (time.time()-t0) < 0.5:
+                                if self.stop_event.is_set(): break
+                                time.sleep(0.01)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        self.q_status.put(("debug", f"Writer write failed: {e}"))
+                # notify caller that the frame was written
+                if ev is not None:
+                    try:
+                        ev.set()
+                    except Exception:
+                        pass
+                # Enforce exactly 1s pause between ANY packets (interruptible)
+                if self.stop_event.wait(timeout=1.0):
+                    pass
+            except Exception as e:
+                self.q_status.put(("debug", f"Writer exception: {e}"))
+        self.q_status.put(("debug", "Writer thread exiting"))
+
+    def _enqueue_and_wait(self, frame: bytes, timeout: float = 10.0):
+        if self.stop_event.is_set():
+            raise RuntimeError("Stop requested")
+        ev = threading.Event()
+        try:
+            self._writer_queue.put((frame, ev))
+        except Exception as e:
+            raise RuntimeError(f"Queue put failed: {e}")
+        finished = ev.wait(timeout=timeout)
+        if not finished:
+            raise RuntimeError("Write did not complete in time")
+
+    def _get_ct_datetime_and_offset(self):
+        if self.ct_omit_offset:
+            now_local = datetime.now().astimezone()
+            dt_fake = datetime(now_local.year, now_local.month, now_local.day,
+                               now_local.hour, now_local.minute, tzinfo=timezone.utc)
+            return dt_fake, 0
+
+        if self.ct_use_pc_time:
+            dt_utc = datetime.now(timezone.utc)
+            try:
+                offs = datetime.now().astimezone().utcoffset()
+                offset = int(offs.total_seconds() // 60) if offs is not None else self.ct_offset_minutes
+            except Exception:
+                offset = self.ct_offset_minutes
+            return dt_utc, offset
+        else:
+            parsed = parse_manual_ct_datetime(self.ct_manual)
+            if parsed is not None:
+                return parsed, self.ct_offset_minutes
+            else:
+                self.q_status.put(("debug", "CT manual invalid; using PC time as fallback"))
+                dt_utc = datetime.now(timezone.utc)
+                try:
+                    offs = datetime.now().astimezone().utcoffset()
+                    offset = int(offs.total_seconds() // 60) if offs is not None else self.ct_offset_minutes
+                except Exception:
+                    offset = self.ct_offset_minutes
+                return dt_utc, offset
+
+    def _start_ct_thread(self):
+        if not self.ct_enabled:
+            return
+        if getattr(self, "_ct_thread", None) and self._ct_thread.is_alive():
+            return
+        self._ct_thread = threading.Thread(target=self._ct_sender, daemon=True)
+        self._ct_thread.start()
+        self.q_status.put(("debug", "CT thread started."))
+
+    def _ct_sender(self):
+        last_minute_sent = None
+        while not self.stop_event.is_set():
+            now_local = datetime.now().astimezone()
+            secs_to_next = 60 - now_local.second - (now_local.microsecond / 1_000_000)
+            if secs_to_next <= 0:
+                secs_to_next = 0.05
+            if self.stop_event.wait(timeout=secs_to_next):
+                break
+
+            try:
+                dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
+                if last_minute_sent is None or dt_for_payload.minute != last_minute_sent:
+                    ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload,
+                                                             offset_to_send, pty=0, tp=int(bool(self.ct_tp)))
+                    try:
+                        self._enqueue_and_wait(ct_frame)
+                        self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
+                        last_minute_sent = dt_for_payload.minute
+                    except Exception as e:
+                        self.q_status.put(("debug", f"CT thread failed to send: {e}"))
+                        if self.stop_event.is_set():
+                            break
+            except Exception as e:
+                self.q_status.put(("debug", f"CT thread exception: {e}"))
+
+        self.q_status.put(("debug", "CT thread exiting."))
 
     def _prepare_slices_static(self):
         FG = pad_or_truncate(self.params.FGdata, 4, "0").upper()
@@ -424,179 +565,6 @@ class RDSWorker(threading.Thread):
             "RTparts": RTparts, "RTAadd2": RTAadd2, "RTadds": RTadds
         }
 
-    def _safe_write(self, buffer: bytes):
-        """
-        Robust serial write: retries, flush, and attempt reopen on SerialException.
-        Enforces a minimum inter-packet delay of self._send_interval seconds between writes.
-        Waits are interruptible via self.stop_event.
-        Stops the worker (by raising RuntimeError) if repeated failures occur.
-        """
-        if self.stop_event.is_set():
-            raise RuntimeError("Stop requested before write")
-        if not getattr(self.ser, "is_open", False):
-            raise RuntimeError("Serial port closed")
-
-        max_attempts = 3
-        last_exc = None
-        for attempt in range(1, max_attempts + 1):
-            if self.stop_event.is_set():
-                raise RuntimeError("Stop requested before write (during retries)")
-
-            # Enforce inter-packet delay BEFORE each actual write attempt
-            now = time.monotonic()
-            elapsed = now - self._last_send_ts if self._last_send_ts > 0 else None
-            if elapsed is None or elapsed >= self._send_interval:
-                # no wait needed
-                pass
-            else:
-                wait_time = self._send_interval - elapsed
-                # Use interruptible wait
-                if self.stop_event.wait(timeout=wait_time):
-                    raise RuntimeError("Stop requested during inter-packet wait")
-
-            try:
-                with self.write_lock:
-                    self.ser.write(buffer)
-                    try:
-                        if hasattr(self.ser, "flush"):
-                            self.ser.flush()
-                    except Exception:
-                        pass
-                # Update timestamp only after successful write
-                self._last_send_ts = time.monotonic()
-                self._consecutive_write_failures = 0
-                return
-            except serial.SerialTimeoutException as e:
-                last_exc = e
-                self.q_status.put(("debug", f"SerialTimeout on write (attempt {attempt}): {e}"))
-                if self.stop_event.wait(0.2):
-                    break
-                continue
-            except serial.SerialException as e:
-                last_exc = e
-                self.q_status.put(("debug", f"SerialException on write (attempt {attempt}): {e}"))
-                try:
-                    with self.write_lock:
-                        try:
-                            if getattr(self.ser, "is_open", False):
-                                try:
-                                    self.ser.close()
-                                except Exception:
-                                    pass
-                                time.sleep(0.05)
-                            # Attempt reopen
-                            self.ser.open()
-                            # Ensure DTR/RTS are disabled after open
-                            try:
-                                self.ser.dtr = False
-                                self.ser.rts = False
-                            except Exception:
-                                pass
-                            try:
-                                if hasattr(self.ser, "reset_output_buffer"):
-                                    self.ser.reset_output_buffer()
-                                if hasattr(self.ser, "reset_input_buffer"):
-                                    self.ser.reset_input_buffer()
-                            except Exception:
-                                pass
-                            self.q_status.put(("status", "Serial port reopened after exception (auto-recover)."))
-                        except Exception as open_e:
-                            self.q_status.put(("debug", f"Reopen attempt failed: {open_e}"))
-                except Exception:
-                    pass
-                if self.stop_event.wait(0.3):
-                    break
-                continue
-            except Exception as e:
-                last_exc = e
-                self.q_status.put(("debug", f"Unknown error on serial write (attempt {attempt}): {e}"))
-                if self.stop_event.wait(0.2):
-                    break
-                continue
-
-        self._consecutive_write_failures += 1
-        self.q_status.put(("debug", f"Consecutive write failures: {self._consecutive_write_failures}"))
-        if self._consecutive_write_failures >= self._max_write_failures:
-            msg = f"Serial writes failed repeatedly; aborting worker. Last error: {last_exc}"
-            self.q_status.put(("error", msg))
-            self.stop_event.set()
-            raise RuntimeError(msg)
-        raise last_exc
-
-    def _get_ct_datetime_and_offset(self):
-        if self.ct_omit_offset:
-            now_local = datetime.now().astimezone()
-            dt_fake = datetime(now_local.year, now_local.month, now_local.day,
-                               now_local.hour, now_local.minute, tzinfo=timezone.utc)
-            return dt_fake, 0
-
-        if self.ct_use_pc_time:
-            dt_utc = datetime.now(timezone.utc)
-            try:
-                offset = get_pc_offset_minutes()
-            except Exception:
-                offset = self.ct_offset_minutes
-            return dt_utc, offset
-        else:
-            parsed = parse_manual_ct_datetime(self.ct_manual)
-            if parsed is not None:
-                return parsed, self.ct_offset_minutes
-            else:
-                self.q_status.put(("debug", "CT manual invalid; using PC time as fallback"))
-                dt_utc = datetime.now(timezone.utc)
-                try:
-                    offset = get_pc_offset_minutes()
-                except Exception:
-                    offset = self.ct_offset_minutes
-                return dt_utc, offset
-
-    def _start_ct_thread(self):
-        if not self.ct_enabled:
-            return
-        if self._ct_thread and self._ct_thread.is_alive():
-            return
-        self._ct_thread = threading.Thread(target=self._ct_sender, daemon=True)
-        self._ct_thread.start()
-        self.q_status.put(("debug", "CT thread started."))
-
-    def _ct_sender(self):
-        last_minute_sent = None
-        while not self.stop_event.is_set():
-            now_local = datetime.now().astimezone()
-            secs_to_next = 60 - now_local.second - (now_local.microsecond / 1_000_000)
-            if secs_to_next <= 0:
-                secs_to_next = 0.05
-            if self.stop_event.wait(timeout=secs_to_next):
-                break
-
-            try:
-                dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
-                if last_minute_sent is None or dt_for_payload.minute != last_minute_sent:
-                    ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload,
-                                                             offset_to_send, pty=0, tp=int(bool(self.ct_tp)))
-                    try:
-                        self._safe_write(ct_frame)
-                        self.q_status.put(("debug", f"CT (minute-roll) -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
-                        last_minute_sent = dt_for_payload.minute
-                    except Exception as e:
-                        self.q_status.put(("debug", f"CT thread failed to send: {e}"))
-                        if self.stop_event.is_set():
-                            break
-            except Exception as e:
-                self.q_status.put(("debug", f"CT thread exception: {e}"))
-
-        self.q_status.put(("debug", "CT thread exiting."))
-
-    def _send_group0a_ta(self, PS_bytes):
-        try:
-            pair0 = PS_bytes[0] if len(PS_bytes) > 0 else b"  "
-            pair1 = PS_bytes[1] if len(PS_bytes) > 1 else b"  "
-            frame = make_rds_group0a_frame(self.params.GJ_input, tp=int(bool(self.ct_tp)), pty=0, ta=1, ps_bytes_pair=(pair0, pair1))
-            self._safe_write(frame)
-            self.q_status.put(("debug", f"TA group 0A sent -> {hex_dump(frame)} (TP={int(bool(self.ct_tp))})"))
-        except Exception as e:
-            self.q_status.put(("debug", f"Failed to send TA group: {e}"))
-
     def _build_ps_rt_bytes_for_dynamic(self, ps8: str, rt64: str):
         ps16 = ps8_to_ps16(ps8)
         PSparts = [ps16[i:i+2] for i in range(0, 16, 2)]
@@ -630,11 +598,22 @@ class RDSWorker(threading.Thread):
         pairs = [(seq[i], seq[i+1]) for i in range(0, len(seq), 2)]
         return pairs
 
+    def _send_group0a_ta(self, PS_bytes):
+        try:
+            pair0 = PS_bytes[0] if len(PS_bytes) > 0 else b"  "
+            pair1 = PS_bytes[1] if len(PS_bytes) > 1 else b"  "
+            frame = make_rds_group0a_frame(self.params.GJ_input, tp=int(bool(self.ct_tp)), pty=0, ta=1, ps_bytes_pair=(pair0, pair1))
+            self._enqueue_and_wait(frame)
+            self.q_status.put(("debug", f"TA group 0A sent -> {hex_dump(frame)} (TP={int(bool(self.ct_tp))})"))
+        except Exception as e:
+            self.q_status.put(("debug", f"Failed to send TA group: {e}"))
+
     def _send_loop(self):
         static_slices = self._prepare_slices_static()
 
         if not getattr(self.ser, "is_open", False):
-            raise RuntimeError("Serial port not open")
+            # it's OK, writer thread will open if needed on writes
+            self.q_status.put(("debug", "Serial port not open yet - writer will handle opens."))
 
         PS_bytes_static = [encode_gb2312_two_bytes(p) for p in static_slices["PSparts"]]
         RT_bytes_static = [encode_gb2312_two_bytes(p) for p in static_slices["RTparts"]]
@@ -678,17 +657,14 @@ class RDSWorker(threading.Thread):
                 buffer[7] = PS_bytes_to_use[i][1]
                 buffer[8] = EOL
                 try:
-                    self._safe_write(bytes(buffer))
+                    self._enqueue_and_wait(bytes(buffer))
                 except Exception as e:
                     self.q_status.put(("debug", f"PS send failed: {e}"))
                     if self.stop_event.is_set():
                         return False
-                    if self.stop_event.wait(0.5):
-                        return False
                     continue
                 self.q_status.put(("debug", f"PS {i+1}/4 -> {hex_dump(buffer)}"))
                 self.q_status.put(("status", f"PS packet {i+1}/4 sent."))
-                # Now that _safe_write enforces a 1s pause, we don't need an extra sleep here
             return True
 
         def send_rt_loop(RT_bytes_to_use, RTAadd2_b_local):
@@ -709,27 +685,27 @@ class RDSWorker(threading.Thread):
                 buffer[7] = r1[1]
                 buffer[8] = EOL
                 try:
-                    self._safe_write(bytes(buffer))
+                    self._enqueue_and_wait(bytes(buffer))
                 except Exception as e:
                     self.q_status.put(("debug", f"RT send failed: {e}"))
                     if self.stop_event.is_set():
-                        return False
-                    if self.stop_event.wait(0.5):
                         return False
                 self.q_status.put(("debug", f"RT {addr_index+1}/16 -> {hex_dump(buffer)}"))
                 self.q_status.put(("status", f"RT packet {addr_index+1}/16 sent."))
                 rt_index_local += 2
             return True
 
-        last_minute_sent = None
         if self.ct_enabled:
             try:
                 dt_for_payload, offset_to_send = self._get_ct_datetime_and_offset()
                 ct_frame = make_rds_ct_payload_and_frame(self.params.GJ_input, dt_for_payload, offset_to_send, pty=0, tp=int(bool(self.ct_tp)))
                 try:
-                    self._safe_write(ct_frame)
+                    self._enqueue_and_wait(ct_frame)
                     self.q_status.put(("debug", f"CT initial -> {hex_dump(ct_frame)} (omit_offset={self.ct_omit_offset}, TP={int(bool(self.ct_tp))})"))
-                    last_minute_sent = dt_for_payload.minute
+                    for _ in range(5):
+                        if self.stop_event.is_set():
+                            return
+                        time.sleep(0.1)
                 except Exception as e:
                     self.q_status.put(("debug", f"CT initial failed: {e}"))
             except Exception as e:
@@ -738,7 +714,6 @@ class RDSWorker(threading.Thread):
         if self.ct_enabled:
             self._start_ct_thread()
 
-        # Main send loop.
         while not self.stop_event.is_set():
             if self.dynamic_scheduler_enabled:
                 active = find_active_schedule_entry(self.scheduler_entries, when=datetime.now().astimezone())
@@ -763,20 +738,19 @@ class RDSWorker(threading.Thread):
                         time.sleep(1.0)
                     continue
             else:
-                # Static mode
                 if self.alt_freqs:
                     try:
                         af_pairs = self._build_af_pairs_from_altfreqs(self.alt_freqs, PS_bytes_static)
                         if af_pairs:
                             self.q_status.put(("status", f"Sending AF list ({len(self.alt_freqs)} entries, capped at 25 for Method A)"))
-                            for idx, (a,b) in enumerate(af_pairs):
+                            for idx, (a, b) in enumerate(af_pairs):
                                 if self.stop_event.is_set():
                                     break
                                 try:
                                     ps_pair_to_use = (PS_bytes_static[0] if len(PS_bytes_static)>0 else b"  ",
                                                       PS_bytes_static[1] if len(PS_bytes_static)>1 else b"  ")
                                     frame = make_rds_group0a_af_frame(self.params.GJ_input, a, b, tp=int(bool(self.ct_tp)), pty=0, ta=0, ps_bytes_pair=ps_pair_to_use)
-                                    self._safe_write(frame)
+                                    self._enqueue_and_wait(frame)
                                     self.q_status.put(("debug", f"AF pair {idx+1}/{len(af_pairs)} -> {hex_dump(frame)}"))
                                     self.q_status.put(("status", f"AF packet {idx+1}/{len(af_pairs)} sent."))
                                 except Exception as e:
@@ -863,7 +837,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         </div>
       </div>
 
-      <form method="post" action="/save" class="mt-3" id="mainform">
+      <form method="post" action="/save" class="mt-3" id="mainform" onsubmit="return prepareAndSubmit();">
         <div class="row">
           <div class="col-md-6">
             <label class="form-label">Serial port</label>
@@ -1010,13 +984,11 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
           <div class="mt-2">
             <button id="btn-add-sched" class="btn btn-sm btn-primary">Add entry</button>
             <button id="btn-close-sched" class="btn btn-sm btn-secondary">Close</button>
+            <button id="btn-save-sched" class="btn btn-sm btn-success">Save scheduler to config</button>
           </div>
 
           <hr>
           <div id="sched-list" style="max-height:260px; overflow:auto;">
-          </div>
-          <div class="mt-2">
-            <button id="btn-save-sched" class="btn btn-success">Save scheduler to config</button>
           </div>
         </div>
       </div>
@@ -1102,6 +1074,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
       document.getElementById('btn-save-sched').addEventListener('click', () => {
         document.getElementById('scheduler-json').value = JSON.stringify(scheduler);
         document.getElementById('sched-modal').style.display = 'none';
+        alert('Scheduler saved to form. Now press "Save Config" to persist to server.');
       });
 
       // Alt Frequencies JS
@@ -1146,7 +1119,6 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
             const f = altfreqs[idx];
             document.getElementById('afreq-input').value = f.freq;
             document.getElementById('afreq-label').value = f.label || '';
-            // delete original; user will press 'Add' to append (simple flow)
             altfreqs.splice(idx, 1);
             renderAltFreqs();
           });
@@ -1178,6 +1150,7 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
       document.getElementById('btn-save-afreqs').addEventListener('click', () => {
         document.getElementById('alt-freqs-json').value = JSON.stringify(altfreqs);
         document.getElementById('altfreq-modal').style.display = 'none';
+        alert('AF list saved to form. Now press "Save Config" to persist to server.');
       });
 
       // disable static PS/RT when scheduler enabled
@@ -1234,6 +1207,16 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
         }
       });
 
+      // Ensure hidden fields are synced before any form submit
+      function prepareAndSubmit() {
+        try {
+          document.getElementById('scheduler-json').value = JSON.stringify(scheduler || []);
+        } catch(e) {}
+        try {
+          document.getElementById('alt-freqs-json').value = JSON.stringify(altfreqs || []);
+        } catch(e) {}
+        return true;
+      }
     </script>
     </body>
     </html>
@@ -1249,55 +1232,76 @@ def create_flask_app(command_queue: queue.Queue, status_queue: queue.Queue, get_
 
     @app.route("/save", methods=["POST"])
     def save():
+        # Load existing config from disk and update fields instead of creating brand new config
+        existing = {}
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+
         form = request.form
         scheduler_json_str = form.get("scheduler_json", "[]")
         try:
             scheduler_entries = json.loads(scheduler_json_str)
         except Exception:
-            scheduler_entries = []
+            scheduler_entries = existing.get("scheduler_entries", [])
+
         alt_freqs_str = form.get("alt_freqs_json", "[]")
         try:
             alt_freqs = json.loads(alt_freqs_str)
         except Exception:
-            alt_freqs = []
+            alt_freqs = existing.get("alt_freqs", [])
 
         try:
-            baud = int(form.get("baud", 9600))
+            baud = int(form.get("baud", existing.get("baud", 9600)))
         except Exception:
-            baud = 9600
+            baud = existing.get("baud", 9600)
         try:
-            pty_index = int(form.get("pty_index", 1))
+            pty_index = int(form.get("pty_index", existing.get("pty_index", 1)))
         except Exception:
-            pty_index = 1
+            pty_index = existing.get("pty_index", 1)
         try:
-            server_port = int(form.get("server_port", DEFAULT_HTTP_PORT))
+            server_port = int(form.get("server_port", existing.get("server_port", DEFAULT_HTTP_PORT)))
         except Exception:
-            server_port = DEFAULT_HTTP_PORT
+            server_port = existing.get("server_port", DEFAULT_HTTP_PORT)
 
-        cfg = {
-            "port": form.get("port", ""),
+        # Build a new config by taking existing and replacing keys that appear in form.
+        cfg = dict(existing)  # start from existing
+        # update/override fields from form
+        cfg.update({
+            "port": form.get("port", existing.get("port", "")),
             "baud": baud,
             "pty_index": pty_index,
-            "pi": form.get("pi", "C121"),
-            "ps": form.get("ps", "GD-2015"),
-            "rt": form.get("rt", ""),
-            "rt_address": form.get("rt_address", "2"),
-            "debug": bool(form.get("debug")),
-            "save_log": bool(form.get("save_log")),
-            "log_filename": form.get("log_filename", "rds_debug.log") if form.get("log_filename") else "rds_debug.log",
+            "pi": form.get("pi", existing.get("pi", "C121")),
+            "ps": form.get("ps", existing.get("ps", "GD-2015")),
+            "rt": form.get("rt", existing.get("rt", "")),
+            "rt_address": form.get("rt_address", existing.get("rt_address", "2")),
+            "debug": bool(form.get("debug")) or bool(existing.get("debug", False)),
+            "save_log": bool(form.get("save_log")) or bool(existing.get("save_log", False)),
+            "log_filename": form.get("log_filename", existing.get("log_filename", "rds_debug.log")) or "rds_debug.log",
             "server_port": server_port,
-            "ct_enabled": bool(form.get("ct_enabled")),
-            "ct_offset": int(form.get("ct_offset") or 60),
-            "ct_use_pc_time": bool(form.get("ct_use_pc_time")),
-            "ct_manual": form.get("ct_manual", ""),
-            "ct_omit_offset": bool(form.get("ct_omit_offset")),
-            "ct_tp": bool(form.get("ct_tp")),
-            "ct_ta": bool(form.get("ct_ta")),
-            "scheduler_enabled": bool(form.get("scheduler_enabled")),
+            "ct_enabled": bool(form.get("ct_enabled")) or bool(existing.get("ct_enabled", False)),
+            "ct_offset": int(form.get("ct_offset") or existing.get("ct_offset", 60)),
+            "ct_use_pc_time": bool(form.get("ct_use_pc_time")) or bool(existing.get("ct_use_pc_time", True)),
+            "ct_manual": form.get("ct_manual", existing.get("ct_manual", "")),
+            "ct_omit_offset": bool(form.get("ct_omit_offset")) or bool(existing.get("ct_omit_offset", False)),
+            "ct_tp": bool(form.get("ct_tp")) or bool(existing.get("ct_tp", False)),
+            "ct_ta": bool(form.get("ct_ta")) or bool(existing.get("ct_ta", False)),
+            "scheduler_enabled": bool(form.get("scheduler_enabled")) or bool(existing.get("scheduler_enabled", False)),
             "scheduler_entries": scheduler_entries,
             "alt_freqs": alt_freqs,
-            "api_password": form.get("api_password", "")
-        }
+            "api_password": form.get("api_password", existing.get("api_password", ""))
+        })
+
+        # write to disk immediately (so App can pick it up)
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
         command_queue.put(("apply_config", cfg))
         return redirect(url_for("index"))
 
@@ -1696,7 +1700,10 @@ class App:
                 acquired = self.serial_write_lock.acquire(timeout=2)
                 try:
                     if getattr(self.ser, "is_open", False):
-                        self.ser.close()
+                        try:
+                            self.ser.close()
+                        except Exception:
+                            pass
                 finally:
                     if acquired:
                         self.serial_write_lock.release()
@@ -1906,10 +1913,19 @@ class App:
             "api_password": self.cfg.get("api_password", "")
         }
         try:
+            # Merge with existing to avoid accidental loss of other keys
+            merged = {}
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                        merged = json.load(f)
+                except Exception:
+                    merged = {}
+            merged.update(cfg)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
+                json.dump(merged, f, indent=2, ensure_ascii=False)
             self.status_var.set(f"Config saved to {CONFIG_FILE}")
-            self.cfg.update(cfg)
+            self.cfg.update(merged)
         except Exception as e:
             self.status_var.set(f"Save config failed: {e}")
 
@@ -2329,6 +2345,7 @@ class App:
         btn_del = ttk.Button(right, text="Delete selected", command=del_entry); btn_del.pack(fill=tk.X, pady=4)
 
         def save_and_close():
+            # persist scheduler to memory and disk, don't regenerate full config with default values
             self.save_config()
             win.destroy()
 
